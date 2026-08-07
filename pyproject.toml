@@ -1,0 +1,124 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "direktoro"
+# Single source of truth: the version lives in `src/direktoro/__init__.py` and is
+# read from there at build time (see [tool.setuptools.dynamic] below), so the
+# distribution metadata and `direktoro.__version__` cannot drift. That matters
+# more than usual here, because a caller may fold this version into its own
+# call-identity fingerprint: a wheel whose metadata disagrees with its
+# `__version__` would make two runs look different for no reason, or the same
+# for a bad one. tests/test_public_api.py asserts the wiring.
+dynamic = ["version"]
+description = "LLM provider layer: one adapter per provider behind one canonical request shape, one model registry, one routing and provenance discipline."
+readme = "README.md"
+# 3.11 is not forced by `src/` — the package itself runs on older interpreters.
+# It is forced by the test suite, which reads pyproject.toml with `tomllib` to
+# assert the packaging invariants (version single-sourcing, dependency floors,
+# the sdist manifest), and `tomllib` is standard library from 3.11. Adding a TOML
+# dependency to test a zero-dependency package would cost more than the floor
+# does, so the floor stands and this is the honest reason for it.
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Ed Penington" }]
+keywords = [
+    "llm",
+    "provider-abstraction",
+    "model-registry",
+    "anthropic",
+    "openai",
+    "openrouter",
+    "provenance",
+    "reproducibility",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
+# These two are the ONLY dependencies, and that is a deliberate property rather
+# than a coincidence: everything this package does apart from making the call —
+# the registry, the capability seams, the thinking validation, the cost
+# arithmetic, the routing serialisation — is standard library, so it cannot
+# break because something else moved. The `no-sdk-import` CI job checks the other
+# half by installing the wheel `--no-deps` and exercising those paths with
+# neither SDK present.
+#
+# Both are imported lazily, inside the adapters and `build_adapter`, so
+# `import direktoro` succeeds without either installed and a run that uses only
+# Anthropic models never needs `openai`. They are nonetheless HARD dependencies
+# of the distribution, so someone wanting only the registry and cost path still
+# installs both. Moving them to extras would change what every consumer has to
+# declare, so it is an interface change to make on purpose, not a side effect.
+#
+# THE anthropic FLOOR (>=0.77). `AnthropicAdapter.create_message` passes
+# `thinking=` and `output_config=` to `messages.stream(...)`. Those are named
+# parameters with no `**kwargs`, so an SDK missing either raises TypeError at
+# CALL time rather than at install time — nothing catches it until a paid run
+# does. 0.77.0 is where the pair first exists: `thinking` from 0.47.0 (absent in
+# 0.46.0), `output_config` from 0.77.0 (absent in 0.76.0), measured by inspecting
+# the signature in each published wheel. This repo's suite runs offline and so
+# cannot re-fetch old wheels; what it CAN check is the SDK that is actually going
+# to be called, and
+# `test_the_installed_sdk_accepts_what_the_adapter_sends` does that on every run.
+#
+# THE openai FLOOR (>=1.66). `OpenAIAdapter.create_message` calls
+# `client.responses.create(...)` on the direct-OpenAI path. That is the Responses
+# API, and the `responses` namespace first ships in openai-python 1.66.0 — an
+# older SDK has no such attribute, so the failure is an AttributeError at call
+# time, the same shape of late failure as the anthropic floor.
+# `test_the_openai_floor_matches_what_the_adapter_calls` checks the installed
+# SDK, and `test_the_declared_floors_are_the_justified_ones` pins both numbers so
+# that moving one means rewriting the justification above rather than drifting to
+# whatever happened to be installed. A floor set that way over-constrains every
+# consumer downstream and nothing notices.
+dependencies = [
+    "anthropic>=0.77",
+    "openai>=1.66",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+direktoro-smoke = "direktoro.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/edpenington/direktoro"
+Repository = "https://github.com/edpenington/direktoro"
+Issues = "https://github.com/edpenington/direktoro/issues"
+
+[tool.setuptools.dynamic]
+version = { attr = "direktoro.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# PEP 561: ship the `py.typed` marker so a type checker reads the annotations in
+# the installed package instead of treating every import from it as untyped.
+# `Model`, `Thinking`, `ThinkingSupport`, `NormalisedResponse`, `NormalisedUsage`
+# and `Route` are annotated dataclasses, and they are exactly the values a
+# consumer holds onto, stores and passes around — so a wrong field name or a
+# `None` where a `str` belongs is caught at check time rather than mid-run.
+[tool.setuptools.package-data]
+direktoro = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# So the suite runs against `src/` without an install. In a checkout that is what
+# an editable install already points at, so nothing changes; from an unpacked
+# sdist it is the difference between `pip install pytest && pytest` working and
+# every test erroring on `import direktoro`. The sdist ships the complete suite
+# (see MANIFEST.in), and a shipped suite nobody can run is barely worth shipping.
+pythonpath = ["src"]

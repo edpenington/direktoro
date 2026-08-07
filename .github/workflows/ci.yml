@@ -1,0 +1,180 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Nothing here writes to the repository, publishes, or reads a secret. Saying so
+# explicitly means a workflow that later grows a step which DOES need write
+# access has to ask for it in this file, where the change is reviewable, rather
+# than inheriting it.
+permissions:
+  contents: read
+
+# One run per ref. Pushing twice in quick succession cancels the older run rather
+# than racing it: the result of a superseded commit is not information anyone
+# acts on, and every job here builds artefacts under the same names.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep the checkout clean and match how the suite is run locally.
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The versions pyproject.toml claims support for.
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: pip install -e ".[dev]"
+      # The suite is hermetic: tests/conftest.py installs a session-wide network
+      # guard, every adapter runs against a stub client, and no API key is read.
+      # So there is nothing to configure here and nothing that can spend.
+      - run: pytest -q
+      # The entry point, exercised for real. `direktoro-smoke` dry-runs by
+      # default: it builds and prints the canonical request for one model per
+      # provider and exits without a client, a key or a network call, so this
+      # proves the console script is installed and wired to a `main` that runs,
+      # and it costs nothing. `--dry-run` is passed explicitly rather than relied
+      # on as the default, so a change to that default cannot silently turn this
+      # step into a spending one.
+      - run: direktoro-smoke --dry-run
+
+  packaging:
+    # What a consumer receives, checked as the artefacts themselves rather than
+    # as intentions in pyproject.toml.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - run: python -m build
+      # twine's own upload-time validation, run BEFORE a release rather than as
+      # the thing that rejects one: malformed metadata, an unrenderable README,
+      # a missing license expression. --strict makes warnings fail, because a
+      # warning here becomes a broken PyPI page nobody can fix without a new
+      # version number.
+      - run: twine check --strict dist/*
+      - name: The wheel ships the package and nothing else
+        run: |
+          python - <<'PY'
+          import zipfile, glob
+          wheel = glob.glob("dist/*.whl")[0]
+          names = zipfile.ZipFile(wheel).namelist()
+
+          # Tests belong in the sdist, where someone can run them against the
+          # source they came with. In a wheel they are dead weight installed
+          # into every consumer's environment, and `tests` is a top-level name
+          # generic enough to collide with the consumer's own.
+          leaked = [n for n in names
+                    if n.startswith("tests/") or n.startswith("tests.")]
+          assert not leaked, f"wheel ships test files: {leaked}"
+
+          # PEP 561: without this marker a type checker ignores the annotations
+          # in the installed package, and the dataclasses a consumer holds
+          # become Any.
+          assert any(n.endswith("direktoro/py.typed") for n in names), (
+              f"wheel is missing direktoro/py.typed: {names}")
+          print("ok", wheel)
+          PY
+      - run: pip install dist/*.whl
+      - name: Installed metadata version equals direktoro.__version__
+        run: |
+          python - <<'PY'
+          import importlib.metadata as md
+          import direktoro
+          # pyproject declares `dynamic = ["version"]` and reads the attribute,
+          # so these two cannot disagree unless that wiring broke. They must not:
+          # a caller may fold this version into its own call-identity
+          # fingerprint, where a disagreement is invisible.
+          assert md.version("direktoro") == direktoro.__version__, (
+              md.version("direktoro"), direktoro.__version__)
+          print("ok", direktoro.__version__)
+          PY
+
+  no-sdk-import:
+    # direktoro promises that `import direktoro`, the registry, and the cost
+    # arithmetic work with NEITHER the anthropic nor the openai SDK installed
+    # (both are lazily imported inside the adapters). Consumers rely on it when
+    # they install a wheel --no-deps, so the claim is checked against a built
+    # wheel in a clean environment rather than asserted in a docstring.
+    # tests/test_public_api.py checks the same property by poisoning
+    # sys.modules; this checks it for real.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python -m build --wheel
+      - run: pip install --no-deps dist/*.whl
+      - name: Import, resolve and cost with no SDK present
+        run: |
+          python - <<'PY'
+          import importlib.util as u
+          for sdk in ("anthropic", "openai"):
+              assert u.find_spec(sdk) is None, f"{sdk} unexpectedly installed"
+          import direktoro
+          from direktoro import (
+              Thinking, cost_from_rates, model_info, resolved_decoding_params)
+          assert model_info("claude-opus-5").provider == "anthropic"
+          # Rates are the caller's, so this is arithmetic on the caller's own
+          # numbers: 1M input tokens at $5/MTok.
+          assert cost_from_rates(rates={"input": 5.0},
+                                 input_tokens=1_000_000) == 5.0
+          assert resolved_decoding_params(
+              "claude-opus-5", temperature=None, max_tokens=8192,
+              thinking=Thinking(mode="adaptive", effort="high"))["thinking"] \
+              == {"type": "adaptive"}
+          print("ok", direktoro.__version__)
+          PY
+
+  sdist-suite:
+    # CI runs pytest from the CHECKOUT, where tests/conftest.py — the file
+    # holding the session-wide network guard — is always present, so a checkout
+    # run cannot tell whether the PUBLISHED suite still has it. Without the
+    # guard the shipped tests reach for real hosts, which is exactly the
+    # property this package claims they cannot do. So this job runs what is
+    # actually published, unpacked into a directory containing nothing but
+    # pytest.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build pytest
+      - run: python -m build --sdist
+      - name: Unpack the sdist and run the suite it ships
+        run: |
+          mkdir -p /tmp/sdist
+          tar xzf dist/*.tar.gz -C /tmp/sdist --strip-components=1
+          cd /tmp/sdist
+          # Nothing installed: no direktoro, no anthropic, no openai. The tests
+          # that construct a REAL SDK object — the error-translation tables, and
+          # the two floor checks that inspect the installed SDK — declare that
+          # with `pytest.importorskip` and skip themselves here; everything else
+          # must pass, offline, from src/ via the pytest `pythonpath` setting.
+          # No count is stated: adding a row to a translation table changes it,
+          # and a number nobody re-measures is worse than no number.
+          python - <<'PY'
+          import importlib.util as u
+          for absent in ("direktoro", "anthropic", "openai"):
+              assert u.find_spec(absent) is None, f"{absent} unexpectedly installed"
+          PY
+          pytest -q

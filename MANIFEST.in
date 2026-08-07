@@ -1,0 +1,20 @@
+# What the source distribution carries beyond the package itself.
+#
+# THE TEST SUITE, COMPLETE. setuptools' default sdist sweeps up `tests/test*.py`
+# and nothing else under `tests/`, which would ship the suite without
+# `tests/conftest.py` — the file holding the session-wide network guard. A suite
+# shipped without that guard is worse than no suite at all here: the guard is
+# what makes "these tests cannot reach the network and cannot spend money" a
+# checkable claim rather than a promise, and without it the shipped tests reach
+# for real hosts. `recursive-include tests *.py` ships every module together
+# with its conftest, and `[tool.pytest.ini_options] pythonpath = ["src"]` in
+# pyproject.toml makes an unpacked sdist runnable with nothing installed but
+# pytest.
+recursive-include tests *.py
+
+# Build and editor droppings never belong in a distribution: they inflate it,
+# they vary between machines so two builds of one commit differ, and a stale
+# .pyc can shadow the source it was compiled from.
+global-exclude *.py[cod]
+global-exclude .DS_Store
+prune **/__pycache__
