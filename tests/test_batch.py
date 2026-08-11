@@ -297,7 +297,7 @@ def _batch_params(model=_LIVE_MODEL, **overrides):
     """A canonical batch request built the way a caller should build one: the
     decoding block comes from `resolved_decoding_params`, the same function the
     live adapter uses, so the two paths send the same parameters."""
-    decoding = resolved_decoding_params(model, temperature=0.0, max_tokens=512)
+    decoding = resolved_decoding_params(model, sampling={"temperature": 0.0}, max_tokens=512)
     params = {"model": model,
               "system": [{"type": "text", "text": "s"}],
               "messages": [{"role": "user", "content": "hi"}],
@@ -333,7 +333,7 @@ def _live_response(message, params):
     return AnthropicAdapter(_LiveClient(message)).create_message(
         model=params["model"], system=params["system"],
         messages=params["messages"], max_tokens=params["max_tokens"],
-        temperature=params.get("temperature"))
+        sampling={"temperature": params.get("temperature")})
 
 
 def test_a_batch_response_matches_a_live_one_field_for_field():

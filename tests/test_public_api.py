@@ -95,7 +95,7 @@ def test_routing_names_are_public():
 # controls (False for google/gemini-3.6-flash, whose Vertex endpoints dropped
 # them).
 CAPABILITY_PREDICATES = ["supports_forced_tool_choice",
-                         "supports_sampling_params"]
+                         "rejected_sampling_params"]
 
 
 def test_capability_predicates_are_public():

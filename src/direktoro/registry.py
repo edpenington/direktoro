@@ -3,8 +3,9 @@ reach, across providers.
 
 Each model id maps to a `Model` record carrying its provider, API base URL,
 API-key environment variable, capability flags, and a `quirks` dict for
-provider-specific decoding rules (for example the GPT-5.x and Opus 4.7+
-families reject `temperature`).
+provider-specific decoding rules (today, the OpenAI reasoning-effort level).
+Which sampling controls an endpoint refuses is its own declaration,
+`Model.rejects_sampling`.
 
 What this registry knows is how to REACH a model and what that model can do.
 Unit prices live in `direktoro.prices`, a dated table recording each vendor's
@@ -86,7 +87,7 @@ set it explicitly because a probe actually sent an image, while all eleven
 direct entries simply take the default True, which stands on the published model
 reference like the rest of their row and on no probe at all.
 
-A family constant (`_NO_TEMP`, `_EFFORTS_4_7`, `_THINK_OPUS_4_7`, ...) is shared
+A family constant (`_NO_SAMPLING`, `_EFFORTS_4_7`, `_THINK_OPUS_4_7`, ...) is shared
 between entries because the published reference states the fact per FAMILY, and
 the constant's own comment carries that citation and its read date. Sharing one
 is therefore not inference from a sibling: it is a single documented fact
@@ -318,14 +319,39 @@ class ThinkingSupport:
 class Model:
     """One model's provider, routing, capabilities, and quirks.
 
+    TWO KINDS OF DECODING PARAMETER
+    -------------------------------
+    Everything this record says about decoding falls into one of two classes,
+    and they are not interchangeable:
+
+      - CALLER-SPECIFIED. The caller chose it, so this record's job is to say
+        whether the endpoint takes it. `rejects_sampling` and `thinking` are
+        the two declarations; `resolved_decoding_params` honours a specified
+        value the endpoint accepts, and for one it does not, either omits it
+        (sampling) or refuses the call (thinking). An unspecified one is
+        absent from the wire and from call identity, and the provider's own
+        default applies — a fact about the provider, not about this table.
+      - REGISTRY-SUPPLIED. This record chose it, and the caller has no say:
+        `quirks["reasoning_effort"]` is the only member. It is sent on every
+        call to the entries that declare it and folds into call identity like
+        any other sent param, but it is never something a caller can be told
+        it "configured in vain", because it configured nothing.
+
+    A caller-facing consumer reports an inert CALLER-SPECIFIED param (one it
+    asked for that the endpoint will not take) and says nothing about either an
+    unspecified one or a registry-supplied one. Keeping the classes apart is
+    what makes that reporting possible.
+
     `quirks` carries provider-specific decoding rules read by the adapters:
 
-      - `no_temperature`: the model rejects the `temperature` parameter
-        (Opus 4.7+, and the GPT-5.x reasoning family). The adapter omits it.
       - `reasoning_effort`: an OpenAI reasoning-effort level ("low" | "medium"
         | "high") the OpenAI adapter passes as `reasoning={"effort": ...}` on
         the Responses wire, or as `reasoning_effort` on the Chat Completions
-        wire.
+        wire. REGISTRY-SUPPLIED, per the split above: the per-call thinking
+        seam emits Anthropic wire keys and refuses the OpenAI families, so
+        reasoning effort reaches those endpoints only from here. Making it
+        caller-specifiable needs their accepted effort levels live-verified
+        first (see HOW A FACT GETS INTO THIS TABLE).
 
     `wire_api` selects the OpenAI-family wire protocol (`WIRE_RESPONSES` or
     `WIRE_CHAT_COMPLETIONS`); it is read only by the OpenAI adapter and ignored
@@ -359,25 +385,31 @@ class Model:
     NOT a call-identity input: the tool_choice mode follows from the model id,
     which identity already carries, so recording it is provenance, not identity.
 
-    `supports_sampling_params` declares whether the model's endpoint accepts the
-    sampling controls (`temperature`, and `top_p` if the layer ever emits one).
-    True for every endpoint that lists them; False for a model whose provider
-    dropped them entirely (Gemini 3.6 Flash: its Vertex endpoints list neither
-    `temperature` nor `top_p` in `supported_parameters`, where 3.5's did — Google
-    removed sampling controls on 3.6). It is a CAPABILITY seam distinct from the
-    `no_temperature` quirk: the quirk marks a reasoning model that rejects only
-    `temperature` (Opus 4.7+, GPT-5.x) while still taking other sampling controls;
-    this flag marks a model that takes NO sampling controls at all. Both funnel
-    through `resolved_decoding_params`, which omits a param the model will not
-    accept, so the omission is honest — the param is absent from BOTH the wire
-    request and the recorded decoding params folded into call identity (never
-    stripped from the wire while still fingerprinted). Editing a config
-    temperature therefore never moves the identity of a model that ignores it,
-    exactly as for `no_temperature`. The live 404 (`require_parameters` refuses
-    an endpoint that would silently drop a sent param) stays the loud backstop
-    should a sampling param ever leak through. Read via the
-    `supports_sampling_params` accessor (mirrors `supports_forced_tool_choice`);
-    like it, the flag reaches call identity only through
+    `rejects_sampling` names the sampling controls (`SAMPLING_PARAMS`:
+    `temperature`, `top_p`, `top_k`) this model's endpoint REFUSES. Empty — the
+    default — means it takes whatever it is sent, which is also what an entry
+    says when nobody has established otherwise: this field claims refusals, never
+    acceptances, so an undeclared param is sent rather than guessed at.
+
+    It is one declaration covering what were two separate shapes of the same
+    fact: a reasoning model that rejects only some controls, and a model whose
+    provider dropped them all. Both are now a set of names, and a new sampling
+    control is a name in that set rather than a new field. Today's values:
+    Opus 4.7+ and Sonnet 5 refuse all three (the Claude model reference lists
+    them as removed for that family); the GPT-5.x reasoning entries refuse
+    `temperature`, which is what their documentation states and the only one
+    established for them; Gemini 3.6 Flash refuses `temperature` and `top_p`,
+    which is what its Vertex `supported_parameters` omits.
+
+    `resolved_decoding_params` omits a refused param, so the omission is honest —
+    the param is absent from BOTH the wire request and the recorded decoding
+    params folded into call identity, never stripped from the wire while still
+    fingerprinted. Editing a caller's temperature therefore never moves the
+    identity of a model that would refuse it. The live 404 (`require_parameters`
+    refuses an endpoint that would silently drop a sent param) stays the loud
+    backstop should one ever leak through. Read via the
+    `rejected_sampling_params` accessor (mirrors `supports_forced_tool_choice`);
+    like it, the declaration reaches call identity only through
     `resolved_decoding_params` dropping the param, never on its own.
 
     `retired` marks an id the provider has withdrawn: the entry is kept so past
@@ -437,7 +469,7 @@ class Model:
     wire_api: str = WIRE_RESPONSES
     supports_images: bool = True
     forced_tool_choice: bool = True
-    supports_sampling_params: bool = True
+    rejects_sampling: frozenset = frozenset()
     retired: bool = False
     route: Optional[Route] = None
     thinking: Optional[ThinkingSupport] = None
@@ -453,14 +485,41 @@ class Model:
                 "WIRE_CHAT_COMPLETIONS: the OpenRouter provider object, "
                 "pin assertion, and reported-cost capture exist only on "
                 "that path.")
+        # `rejects_sampling` occupies the slot a boolean flag once did, and the
+        # record is reachable positionally, so a value of the wrong shape is
+        # refused at import rather than read as a truthy set of no names. An
+        # unknown name is refused for the opposite reason: it would silently
+        # declare a refusal of something nothing ever sends, which reads as a
+        # documented fact while doing nothing.
+        if not isinstance(self.rejects_sampling, (frozenset, set)):
+            raise TypeError(
+                f"rejects_sampling must be a set of sampling parameter names "
+                f"from {list(SAMPLING_PARAMS)}, got "
+                f"{type(self.rejects_sampling).__name__}.")
+        unknown = sorted(set(self.rejects_sampling) - set(SAMPLING_PARAMS))
+        if unknown:
+            raise ValueError(
+                f"rejects_sampling names {unknown}, which are not sampling "
+                f"parameters; it accepts {list(SAMPLING_PARAMS)}.")
 
 
-# Opus 4.7 and later (4.7, 4.8, 5) and Sonnet 5 reject the temperature
-# parameter: a non-default temperature/top_p/top_k returns a 400. Claude model
-# reference, read 2026-08-01, which lists those sampling params as removed for
-# this family — one documented family fact, recorded once and shared by the
-# entries it covers rather than transcribed per row.
-_NO_TEMP = {"no_temperature": True}
+# The sampling controls a caller may specify, and the only names
+# `Model.rejects_sampling` accepts. Ordered, and emitted in this order, so the
+# decoding params folded into call identity do not depend on set iteration.
+SAMPLING_PARAMS = ("temperature", "top_p", "top_k")
+
+# Opus 4.7 and later (4.7, 4.8, 5) and Sonnet 5 reject the sampling controls: a
+# non-default temperature/top_p/top_k returns a 400. Claude model reference,
+# read 2026-08-01, which lists all three as removed for this family — one
+# documented family fact, recorded once and shared by the entries it covers
+# rather than transcribed per row.
+_NO_SAMPLING = frozenset(SAMPLING_PARAMS)
+
+# The GPT-5.x reasoning entries. Their documentation establishes that they
+# reject `temperature`; it says nothing either way about the other two, so
+# neither is named. `rejects_sampling` claims refusals only, so an unestablished
+# one is sent and the endpoint's own answer settles it.
+_NO_TEMPERATURE = frozenset({"temperature"})
 
 # ---- Thinking / effort capability presets --------------------------------
 # Anthropic model reference + migration guide, verified 2026-07-31. These are
@@ -545,33 +604,33 @@ MODEL_REGISTRY = {
     # verified against the published model and deprecation tables 2026-07-31.
     "claude-opus-5": Model(
         PROVIDER_ANTHROPIC, None, ANTHROPIC_KEY_ENV,
-        quirks=_NO_TEMP, thinking=_THINK_OPUS_5),
+        rejects_sampling=_NO_SAMPLING, thinking=_THINK_OPUS_5),
     # Opus 4.8. Context 1M, max output 128K. Adaptive thinking is the only
     # on-mode and is OFF when the `thinking` param is omitted. Verified
     # 2026-07-31.
     "claude-opus-4-8": Model(
         PROVIDER_ANTHROPIC, None, ANTHROPIC_KEY_ENV,
-        quirks=_NO_TEMP, thinking=_THINK_OPUS_4_7),
+        rejects_sampling=_NO_SAMPLING, thinking=_THINK_OPUS_4_7),
     # Opus 4.7. Context 1M, max output 128K. Same thinking surface as 4.8 — one
     # documented family fact shared via `_THINK_OPUS_4_7` (Anthropic model
     # reference + migration guide, read 2026-07-31), not a value copied across
     # from the neighbouring row.
     "claude-opus-4-7": Model(
         PROVIDER_ANTHROPIC, None, ANTHROPIC_KEY_ENV,
-        quirks=_NO_TEMP, thinking=_THINK_OPUS_4_7),
+        rejects_sampling=_NO_SAMPLING, thinking=_THINK_OPUS_4_7),
     # Sonnet 5. Context 1M, max output 128K. Dateless 4.6-generation id, i.e. a
     # pinned snapshot (see the snapshot note above), so it is citation-grade as
     # written. Rejects the temperature parameter like the Opus 4.7+ family (the
     # Claude model reference lists Sonnet 5's temperature/top_p/top_k as
-    # removed -> 400), so it carries _NO_TEMP; supports images (default).
+    # removed -> 400), so it carries _NO_SAMPLING; supports images (default).
     # THINKING: adaptive runs when the param is omitted (Sonnet 4.6 does not),
     # `disabled` is accepted at any effort, `budget_tokens` is a 400, and it is
     # the first Sonnet with `xhigh`.
     "claude-sonnet-5": Model(
         PROVIDER_ANTHROPIC, None, ANTHROPIC_KEY_ENV,
-        quirks=_NO_TEMP, thinking=_THINK_SONNET_5),
+        rejects_sampling=_NO_SAMPLING, thinking=_THINK_SONNET_5),
     # Sonnet 4.6. Context 1M, max output 128K. Takes sampling params (no
-    # _NO_TEMP). Adaptive thinking is OFF when the param is omitted;
+    # refusals). Adaptive thinking is OFF when the param is omitted;
     # `budget_tokens` still functions here as the deprecated escape hatch; the
     # effort ladder stops at `max` (no `xhigh` before Opus 4.7).
     "claude-sonnet-4-6": Model(
@@ -614,12 +673,14 @@ MODEL_REGISTRY = {
     # reasoning effort.
     "gpt-5.6-sol": Model(
         PROVIDER_OPENAI, OPENAI_BASE_URL, OPENAI_KEY_ENV,
-        quirks={"no_temperature": True, "reasoning_effort": "medium"},
+        quirks={"reasoning_effort": "medium"},
+        rejects_sampling=_NO_TEMPERATURE,
         wire_api=WIRE_RESPONSES),
     # GPT-5.6 mid-tier. Same reasoning-model surface as the flagship.
     "gpt-5.6-terra": Model(
         PROVIDER_OPENAI, OPENAI_BASE_URL, OPENAI_KEY_ENV,
-        quirks={"no_temperature": True, "reasoning_effort": "medium"},
+        quirks={"reasoning_effort": "medium"},
+        rejects_sampling=_NO_TEMPERATURE,
         wire_api=WIRE_RESPONSES),
 
     # ---- Routed via OpenRouter ---------------------------------------------
@@ -754,9 +815,9 @@ MODEL_REGISTRY = {
     # endpoints' supported_parameters list include_reasoning, max_tokens,
     # reasoning, reasoning_effort, response_format, seed, stop,
     # structured_outputs, tool_choice, tools — but NEITHER temperature NOR top_p
-    # (Google dropped sampling controls on 3.6), so this entry sets
-    # supports_sampling_params=False and resolved_decoding_params omits
-    # temperature from both wire and fingerprint.
+    # (Google dropped sampling controls on 3.6), so this entry names both in
+    # rejects_sampling and resolved_decoding_params omits them from both wire
+    # and fingerprint.
     # LIVE PROBES (2026-07-24): the full pin
     # (order=["google-vertex/global/flex"], allow_fallbacks False, require_
     # parameters True, data_collection deny, zdr True) PLUS temperature:0.0 ->
@@ -785,7 +846,8 @@ MODEL_REGISTRY = {
         # The 3.6 Vertex endpoints list no temperature / top_p (Google dropped
         # sampling controls on 3.6, live 2026-07-24): omit them honestly from wire
         # and fingerprint, and let the require_parameters 404 be the loud backstop.
-        supports_sampling_params=False,
+        # top_k is not named: its absence from that list was not established.
+        rejects_sampling=frozenset({"temperature", "top_p"}),
         route=Route(gateway=GATEWAY_OPENROUTER,
                     upstream=("google-vertex/global/flex",),
                     quantizations=())),
@@ -914,26 +976,28 @@ def supports_forced_tool_choice(model):
     return model_info(model).forced_tool_choice
 
 
-def supports_sampling_params(model):
-    """Whether `model`'s endpoint accepts the sampling controls (temperature,
-    top_p).
+def rejected_sampling_params(model):
+    """The sampling controls `model`'s endpoint refuses, as a frozenset.
 
-    True for every endpoint that lists them; False for a model whose provider
-    dropped them entirely (google/gemini-3.6-flash, whose Vertex endpoints list
-    neither temperature nor top_p in supported_parameters — confirmed live
-    2026-07-24). The decoding resolver (`resolved_decoding_params`) consults the
-    field this reads and OMITS a non-accepted sampling param from both the wire
-    request and the fingerprint's decoding_params block, so a config temperature
-    against a non-supporting model is honestly absent rather than silently
-    stripped-but-fingerprinted. This is a broader seam than the `no_temperature`
-    quirk (which drops only temperature for a reasoning model that still takes
-    other sampling controls): this flag drops ALL sampling controls. Raises
-    ValueError for an unknown id, like `model_info`, so the capability is never
-    guessed from a missing entry. Mirrors `supports_forced_tool_choice` (the
-    field lives on the `Model` record too, as
-    `model_info(model).supports_sampling_params`; this is the named accessor).
+    Empty for an endpoint that takes what it is sent, and empty equally for one
+    nobody has established a refusal for: this reports declared refusals, never
+    acceptances. Today: Opus 4.7+ and Sonnet 5 refuse all of
+    `temperature`/`top_p`/`top_k`; the GPT-5.x reasoning entries refuse
+    `temperature`; google/gemini-3.6-flash refuses `temperature` and `top_p`
+    (its Vertex endpoints list neither in supported_parameters — confirmed live
+    2026-07-24).
+
+    The decoding resolver (`resolved_decoding_params`) consults the field this
+    reads and OMITS a refused param from both the wire request and the
+    fingerprint's decoding_params block, so a caller's temperature against a
+    model that refuses it is honestly absent rather than silently
+    stripped-but-fingerprinted. Raises ValueError for an unknown id, like
+    `model_info`, so the capability is never guessed from a missing entry.
+    Mirrors `supports_forced_tool_choice` (the field lives on the `Model`
+    record too, as `model_info(model).rejects_sampling`; this is the named
+    accessor).
     """
-    return model_info(model).supports_sampling_params
+    return frozenset(model_info(model).rejects_sampling)
 
 
 def thinking_support(model):
@@ -954,7 +1018,7 @@ def thinking_support(model):
     thinking": it means direktoro will refuse to emit a thinking shape for that
     model rather than guess one. Raises ValueError for an unknown id, like
     `model_info`. Mirrors `supports_forced_tool_choice` /
-    `supports_sampling_params` (the field lives on the `Model` record too, as
+    `rejected_sampling_params` (the field lives on the `Model` record too, as
     `model_info(model).thinking`; this is the named accessor).
     """
     return model_info(model).thinking

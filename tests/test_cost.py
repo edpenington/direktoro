@@ -17,8 +17,8 @@ import pytest
 from direktoro.cost import COUNTERS, cost_from_rates, cost_from_usage
 from direktoro.providers import NormalisedUsage, resolved_decoding_params
 from direktoro.registry import (
-    MODEL_REGISTRY, Model, is_known_model, is_retired, known_models,
-    model_info)
+    MODEL_REGISTRY, Model, SAMPLING_PARAMS, is_known_model, is_retired,
+    known_models, model_info)
 
 
 class TestKnownModels:
@@ -187,13 +187,13 @@ class TestRetirementGateIsReachableFromTheLibrary:
         # rather than optional.
         from direktoro import (
             call_identity_fields, model_supports_images,
-            supports_forced_tool_choice, supports_sampling_params,
+            supports_forced_tool_choice, rejected_sampling_params,
             thinking_support)
 
         assert model_info(self.RETIRED_ID).provider == "anthropic"
         assert model_supports_images(self.RETIRED_ID) is True
         assert supports_forced_tool_choice(self.RETIRED_ID) is True
-        assert supports_sampling_params(self.RETIRED_ID) is True
+        assert rejected_sampling_params(self.RETIRED_ID) == frozenset()
         assert thinking_support(self.RETIRED_ID) is None
         assert call_identity_fields(self.RETIRED_ID)["model"] == self.RETIRED_ID
 
@@ -252,7 +252,7 @@ class TestModelFieldOrder:
         "wire_api",
         "supports_images",
         "forced_tool_choice",
-        "supports_sampling_params",
+        "rejects_sampling",
         "retired",
         "route",
         "thinking",
@@ -406,16 +406,19 @@ class TestAnthropicCapabilityBlock:
         assert sorted(row[0] for row in self.VERIFIED) == live
 
     @pytest.mark.parametrize("model_id,no_temp", VERIFIED)
-    def test_temperature_quirk(self, model_id, no_temp):
-        assert bool(model_info(model_id).quirks.get("no_temperature")) is no_temp
+    def test_sampling_refusal_is_declared(self, model_id, no_temp):
+        rejected = model_info(model_id).rejects_sampling
+        # The family that refuses them refuses all three, so the declaration is
+        # the whole set or nothing.
+        assert (rejected == frozenset(SAMPLING_PARAMS)) is no_temp
 
     @pytest.mark.parametrize("model_id,no_temp", VERIFIED)
-    def test_the_quirk_reaches_the_resolved_decoding_params(self, model_id,
-                                                            no_temp):
-        # The quirk is only worth recording if it actually removes the param
-        # from what is sent (and from the fingerprint), so assert the effect,
-        # not the flag.
-        dec = resolved_decoding_params(model_id, temperature=0.0,
+    def test_the_declaration_reaches_the_resolved_decoding_params(
+            self, model_id, no_temp):
+        # The declaration is only worth recording if it actually removes the
+        # param from what is sent (and from the fingerprint), so assert the
+        # effect, not the flag.
+        dec = resolved_decoding_params(model_id, sampling={"temperature": 0.0},
                                        max_tokens=100)
         assert ("temperature" in dec) is not no_temp
 
@@ -444,10 +447,10 @@ class TestSonnet5Entry:
 
     def test_rejects_temperature(self):
         # Sonnet 5's sampling params return a 400 (Claude model reference), so
-        # the entry carries the no_temperature quirk and the adapter never sends
-        # a temperature for it.
-        assert model_info("claude-sonnet-5").quirks.get("no_temperature") is True
-        dec = resolved_decoding_params("claude-sonnet-5", temperature=0.0,
+        # the entry declares all three refused and the adapter never sends one.
+        assert model_info("claude-sonnet-5").rejects_sampling == frozenset(
+            SAMPLING_PARAMS)
+        dec = resolved_decoding_params("claude-sonnet-5", sampling={"temperature": 0.0},
                                        max_tokens=100)
         assert "temperature" not in dec
 
@@ -473,8 +476,9 @@ class TestOpus5Entry:
         assert m.retired is False
 
     def test_rejects_temperature(self):
-        assert model_info("claude-opus-5").quirks.get("no_temperature") is True
-        dec = resolved_decoding_params("claude-opus-5", temperature=0.0,
+        assert model_info("claude-opus-5").rejects_sampling == frozenset(
+            SAMPLING_PARAMS)
+        dec = resolved_decoding_params("claude-opus-5", sampling={"temperature": 0.0},
                                        max_tokens=100)
         assert "temperature" not in dec
 
@@ -485,14 +489,16 @@ class TestModelInfo:
         assert m.provider == "anthropic"
         assert m.base_url is None
         assert m.api_key_env == "ANTHROPIC_API_KEY"
-        assert m.quirks.get("no_temperature") is True
+        assert m.rejects_sampling == frozenset(SAMPLING_PARAMS)
 
     def test_openai_metadata(self):
         m = model_info("gpt-5.6-sol")
         assert m.provider == "openai"
         assert m.base_url == "https://api.openai.com/v1"
         assert m.api_key_env == "OPENAI_API_KEY"
-        assert m.quirks.get("no_temperature") is True
+        # Its documentation establishes `temperature` and nothing further.
+        assert m.rejects_sampling == frozenset({"temperature"})
+        assert m.quirks["reasoning_effort"] == "medium"
 
     def test_routed_glm_metadata(self):
         # Routed entries speak the OpenRouter OpenAI-compat Chat Completions
@@ -559,8 +565,8 @@ class TestRoutedFrontierEntries:
         # GLM endpoints); to keep the pinned set uniform the entry runs "auto"
         # and a caller retries.
         assert info.forced_tool_choice is False
-        # MiMo takes the normal sampling controls (default flag).
-        assert info.supports_sampling_params is True
+        # MiMo declares no sampling refusal, so it is sent what it is given.
+        assert info.rejects_sampling == frozenset()
 
     def test_gemini_pin_vertex_flex_tag_forced_tool_and_no_sampling(self):
         info = model_info("google/gemini-3.6-flash")
@@ -571,18 +577,19 @@ class TestRoutedFrontierEntries:
         # Forced named tool_choice verified live at the flex endpoint 2026-07-24.
         assert info.forced_tool_choice is True
         # 3.6's Vertex endpoints list neither temperature nor top_p (Google
-        # dropped sampling controls on 3.6, live 2026-07-24): no sampling params.
-        assert info.supports_sampling_params is False
+        # dropped sampling controls on 3.6, live 2026-07-24). top_k is not
+        # named: its absence from that list was never established.
+        assert info.rejects_sampling == frozenset({"temperature", "top_p"})
 
     def test_gemini_resolver_drops_temperature_mimo_keeps_it(self):
         # The resolution seam: resolved_decoding_params (the single source of
         # truth for wire AND fingerprint) omits temperature for the no-sampling
         # model but keeps it for a sampling-capable routed peer.
         gem = resolved_decoding_params(
-            "google/gemini-3.6-flash", temperature=0.0, max_tokens=64)
+            "google/gemini-3.6-flash", sampling={"temperature": 0.0}, max_tokens=64)
         assert gem == {"max_tokens": 64}
         mimo = resolved_decoding_params(
-            "xiaomi/mimo-v2.5", temperature=0.0, max_tokens=64)
+            "xiaomi/mimo-v2.5", sampling={"temperature": 0.0}, max_tokens=64)
         assert mimo == {"max_tokens": 64, "temperature": 0.0}
 
 

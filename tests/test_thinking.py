@@ -50,23 +50,23 @@ class TestOmittingThinkingChangesNothing:
     @pytest.mark.parametrize("model", [
         OPUS_5, OPUS_4_8, SONNET_5, SONNET_4_6, HAIKU_4_5, GPT, GLM])
     def test_default_emits_no_thinking_keys(self, model):
-        dec = resolved_decoding_params(model, temperature=0.0, max_tokens=4096)
+        dec = resolved_decoding_params(model, sampling={"temperature": 0.0}, max_tokens=4096)
         assert "thinking" not in dec
         assert "output_config" not in dec
 
     def test_anthropic_default_is_exactly_the_two_decoding_keys(self):
         # Opus 5 rejects temperature (_NO_TEMP), so the cap is the whole of it.
         assert resolved_decoding_params(
-            OPUS_5, temperature=0.0, max_tokens=4096) == {"max_tokens": 4096}
+            OPUS_5, sampling={"temperature": 0.0}, max_tokens=4096) == {"max_tokens": 4096}
         # A model that takes temperature still gets exactly the two keys.
         assert resolved_decoding_params(
-            SONNET_4_6, temperature=0.3, max_tokens=4096) == {
+            SONNET_4_6, sampling={"temperature": 0.3}, max_tokens=4096) == {
                 "max_tokens": 4096, "temperature": 0.3}
 
     def test_explicit_none_matches_the_omitted_call(self):
-        assert (resolved_decoding_params(OPUS_5, temperature=None,
+        assert (resolved_decoding_params(OPUS_5,
                                          max_tokens=4096, thinking=None)
-                == resolved_decoding_params(OPUS_5, temperature=None,
+                == resolved_decoding_params(OPUS_5,
                                             max_tokens=4096))
 
     def test_adapter_wire_request_is_unchanged_when_omitted(self):
@@ -87,7 +87,7 @@ class TestEmittedShapes:
 
     def test_adaptive_is_the_current_shape(self):
         dec = resolved_decoding_params(
-            OPUS_5, temperature=None, max_tokens=4096,
+            OPUS_5, max_tokens=4096,
             thinking=Thinking(mode=THINKING_ADAPTIVE))
         assert dec["thinking"] == {"type": "adaptive"}
         # Emphatically NOT the pre-4.6 shape, which 400s on this family.
@@ -95,21 +95,21 @@ class TestEmittedShapes:
 
     def test_effort_rides_output_config(self):
         dec = resolved_decoding_params(
-            OPUS_5, temperature=None, max_tokens=4096,
+            OPUS_5, max_tokens=4096,
             thinking=Thinking(mode=THINKING_ADAPTIVE, effort="xhigh"))
         assert dec["output_config"] == {"effort": "xhigh"}
         assert dec["thinking"] == {"type": "adaptive"}
 
     def test_effort_alone_needs_no_mode(self):
         dec = resolved_decoding_params(
-            SONNET_5, temperature=None, max_tokens=4096,
+            SONNET_5, max_tokens=4096,
             thinking=Thinking(effort="low"))
         assert dec["output_config"] == {"effort": "low"}
         assert "thinking" not in dec
 
     def test_display_opts_into_summarized_thinking(self):
         dec = resolved_decoding_params(
-            OPUS_5, temperature=None, max_tokens=4096,
+            OPUS_5, max_tokens=4096,
             thinking=Thinking(mode=THINKING_ADAPTIVE, display="summarized"))
         assert dec["thinking"] == {"type": "adaptive",
                                    "display": "summarized"}
@@ -119,7 +119,7 @@ class TestEmittedShapes:
         # `type: "adaptive"` or `type: "enabled"`". Requiring adaptive would
         # refuse a shape the pre-4.6 endpoints accept.
         dec = resolved_decoding_params(
-            HAIKU_4_5, temperature=None, max_tokens=8192,
+            HAIKU_4_5, max_tokens=8192,
             thinking=Thinking(mode=THINKING_BUDGET, budget_tokens=2048,
                               display="summarized"))
         assert dec["thinking"] == {"type": "enabled", "budget_tokens": 2048,
@@ -127,7 +127,7 @@ class TestEmittedShapes:
 
     def test_disabled_shape(self):
         dec = resolved_decoding_params(
-            OPUS_4_8, temperature=None, max_tokens=4096,
+            OPUS_4_8, max_tokens=4096,
             thinking=Thinking(mode=THINKING_DISABLED))
         assert dec["thinking"] == {"type": "disabled"}
 
@@ -137,7 +137,7 @@ class TestEmittedShapes:
         # asserting only the thinking block would let the 400-producing pair
         # through unnoticed.
         dec = resolved_decoding_params(
-            HAIKU_4_5, temperature=None, max_tokens=8192,
+            HAIKU_4_5, max_tokens=8192,
             thinking=Thinking(mode=THINKING_BUDGET, budget_tokens=2048))
         assert dec["thinking"] == {"type": "enabled", "budget_tokens": 2048}
         assert "temperature" not in dec
@@ -175,20 +175,20 @@ class TestRefusesShapesTheModelWouldReject:
     def test_budget_tokens_refused_on_the_4_7_plus_families(self, model):
         with pytest.raises(ThinkingUnsupported, match="budget_tokens"):
             resolved_decoding_params(
-                model, temperature=None, max_tokens=8192,
+                model, max_tokens=8192,
                 thinking=Thinking(mode=THINKING_BUDGET, budget_tokens=2048))
 
     def test_disabled_thinking_refused_above_opus_5_effort_ceiling(self):
         for effort in ("xhigh", "max"):
             with pytest.raises(ThinkingUnsupported, match="disabled"):
                 resolved_decoding_params(
-                    OPUS_5, temperature=None, max_tokens=8192,
+                    OPUS_5, max_tokens=8192,
                     thinking=Thinking(mode=THINKING_DISABLED, effort=effort))
 
     def test_disabled_thinking_allowed_at_or_below_high_on_opus_5(self):
         for effort in ("low", "medium", "high"):
             dec = resolved_decoding_params(
-                OPUS_5, temperature=None, max_tokens=8192,
+                OPUS_5, max_tokens=8192,
                 thinking=Thinking(mode=THINKING_DISABLED, effort=effort))
             assert dec["thinking"] == {"type": "disabled"}
 
@@ -196,7 +196,7 @@ class TestRefusesShapesTheModelWouldReject:
         # Anthropic's default effort is `high`, which is exactly the ceiling,
         # so a bare disable is accepted rather than refused on a guess.
         dec = resolved_decoding_params(
-            OPUS_5, temperature=None, max_tokens=8192,
+            OPUS_5, max_tokens=8192,
             thinking=Thinking(mode=THINKING_DISABLED))
         assert dec["thinking"] == {"type": "disabled"}
         assert thinking_support(OPUS_5).default_effort == "high"
@@ -205,26 +205,26 @@ class TestRefusesShapesTheModelWouldReject:
         # `xhigh` arrived with Opus 4.7; Sonnet 4.6's ladder stops at max.
         with pytest.raises(ThinkingUnsupported, match="xhigh"):
             resolved_decoding_params(
-                SONNET_4_6, temperature=None, max_tokens=8192,
+                SONNET_4_6, max_tokens=8192,
                 thinking=Thinking(effort="xhigh"))
 
     def test_effort_refused_on_a_model_with_no_effort_parameter(self):
         with pytest.raises(ThinkingUnsupported,
                            match="no effort parameter at all"):
             resolved_decoding_params(
-                HAIKU_4_5, temperature=None, max_tokens=8192,
+                HAIKU_4_5, max_tokens=8192,
                 thinking=Thinking(effort="high"))
 
     def test_adaptive_refused_on_a_pre_4_6_model(self):
         with pytest.raises(ThinkingUnsupported, match="adaptive"):
             resolved_decoding_params(
-                HAIKU_4_5, temperature=None, max_tokens=8192,
+                HAIKU_4_5, max_tokens=8192,
                 thinking=Thinking(mode=THINKING_ADAPTIVE))
 
     def test_budget_below_the_endpoint_minimum_refused(self):
         with pytest.raises(ThinkingUnsupported, match="minimum"):
             resolved_decoding_params(
-                HAIKU_4_5, temperature=None, max_tokens=8192,
+                HAIKU_4_5, max_tokens=8192,
                 thinking=Thinking(mode=THINKING_BUDGET, budget_tokens=512))
 
     def test_budget_not_below_max_tokens_refused(self):
@@ -232,7 +232,7 @@ class TestRefusesShapesTheModelWouldReject:
         # leaves no room for an answer and the API rejects it.
         with pytest.raises(ThinkingUnsupported, match="strictly less"):
             resolved_decoding_params(
-                HAIKU_4_5, temperature=None, max_tokens=2048,
+                HAIKU_4_5, max_tokens=2048,
                 thinking=Thinking(mode=THINKING_BUDGET, budget_tokens=2048))
 
     def test_budget_with_no_max_tokens_refused(self):
@@ -242,7 +242,7 @@ class TestRefusesShapesTheModelWouldReject:
         # wrong parameter; refusing here names the one that is missing.
         with pytest.raises(ThinkingUnsupported, match="needs a max_tokens"):
             resolved_decoding_params(
-                HAIKU_4_5, temperature=None, max_tokens=None,
+                HAIKU_4_5, max_tokens=None,
                 thinking=Thinking(mode=THINKING_BUDGET, budget_tokens=999999))
 
     def test_display_refused_on_a_model_that_declares_none(self, monkeypatch):
@@ -258,13 +258,13 @@ class TestRefusesShapesTheModelWouldReject:
                       default_effort="high", displays=())))
         # The mode itself is fine …
         assert resolved_decoding_params(
-            "synthetic-no-display", temperature=None, max_tokens=4096,
+            "synthetic-no-display", max_tokens=4096,
             thinking=Thinking(mode=THINKING_ADAPTIVE))["thinking"] == \
             {"type": "adaptive"}
         # … it is the display that is refused, before any spend.
         with pytest.raises(ThinkingUnsupported, match="thinking.display"):
             resolved_decoding_params(
-                "synthetic-no-display", temperature=None, max_tokens=4096,
+                "synthetic-no-display", max_tokens=4096,
                 thinking=Thinking(mode=THINKING_ADAPTIVE,
                                   display="summarized"))
 
@@ -279,7 +279,7 @@ class TestRefusesShapesTheModelWouldReject:
                       default_effort="high", displays=("omitted",))))
         with pytest.raises(ThinkingUnsupported, match="it accepts \\['omitted'\\]"):
             resolved_decoding_params(
-                "synthetic-omitted-only", temperature=None, max_tokens=4096,
+                "synthetic-omitted-only", max_tokens=4096,
                 thinking=Thinking(mode=THINKING_ADAPTIVE,
                                   display="summarized"))
 
@@ -291,7 +291,7 @@ class TestRefusesShapesTheModelWouldReject:
         # honest answer rather than translating on a guess.
         with pytest.raises(ThinkingUnsupported):
             resolved_decoding_params(
-                model, temperature=None, max_tokens=8192,
+                model, max_tokens=8192,
                 thinking=Thinking(mode=THINKING_ADAPTIVE))
 
     def test_undeclared_thinking_support_refuses_rather_than_guesses(self):
@@ -301,7 +301,7 @@ class TestRefusesShapesTheModelWouldReject:
         assert thinking_support("claude-opus-4-20250514") is None
         with pytest.raises(ThinkingUnsupported, match="declares no thinking"):
             resolved_decoding_params(
-                "claude-opus-4-20250514", temperature=None, max_tokens=8192,
+                "claude-opus-4-20250514", max_tokens=8192,
                 thinking=Thinking(mode=THINKING_ADAPTIVE))
 
     def test_refusal_is_a_value_error_subclass(self):
@@ -316,9 +316,9 @@ class TestRefusesShapesTheModelWouldReject:
         # by emitting nothing: same wire, same behaviour, same identity as a
         # `thinking=None` call — no shape is guessed and nothing is refused.
         plain = resolved_decoding_params(
-            HAIKU_4_5, temperature=0.0, max_tokens=4096)
+            HAIKU_4_5, sampling={"temperature": 0.0}, max_tokens=4096)
         disabled = resolved_decoding_params(
-            HAIKU_4_5, temperature=0.0, max_tokens=4096,
+            HAIKU_4_5, sampling={"temperature": 0.0}, max_tokens=4096,
             thinking=Thinking(mode=THINKING_DISABLED))
         assert disabled == plain
         assert thinking_support(HAIKU_4_5).default_on is False
@@ -347,12 +347,12 @@ class TestSamplingParamsAndThinking:
     @pytest.mark.parametrize("model,spec", THINKING_ON)
     def test_temperature_with_active_thinking_is_refused(self, model, spec):
         with pytest.raises(ThinkingUnsupported, match="also turns thinking on"):
-            resolved_decoding_params(model, temperature=0.3, max_tokens=8192,
+            resolved_decoding_params(model, sampling={"temperature": 0.3}, max_tokens=8192,
                                      thinking=spec)
 
     @pytest.mark.parametrize("model,spec", THINKING_ON)
     def test_the_same_call_without_a_temperature_is_fine(self, model, spec):
-        dec = resolved_decoding_params(model, temperature=None,
+        dec = resolved_decoding_params(model,
                                        max_tokens=8192, thinking=spec)
         assert "thinking" in dec
         assert "temperature" not in dec
@@ -362,7 +362,7 @@ class TestSamplingParamsAndThinking:
         # the restriction is on ACTIVE thinking, not on the presence of a spec.
         for spec in (None, Thinking(mode=THINKING_DISABLED),
                      Thinking(effort="high")):
-            dec = resolved_decoding_params(SONNET_4_6, temperature=0.3,
+            dec = resolved_decoding_params(SONNET_4_6, sampling={"temperature": 0.3},
                                            max_tokens=8192, thinking=spec)
             assert dec["temperature"] == 0.3
 
@@ -372,7 +372,7 @@ class TestSamplingParamsAndThinking:
         # errors.
         for model in (OPUS_5, OPUS_4_8, SONNET_5):
             dec = resolved_decoding_params(
-                model, temperature=0.3, max_tokens=8192,
+                model, sampling={"temperature": 0.3}, max_tokens=8192,
                 thinking=Thinking(mode=THINKING_ADAPTIVE))
             assert "temperature" not in dec
             assert dec["thinking"] == {"type": "adaptive"}
@@ -380,10 +380,11 @@ class TestSamplingParamsAndThinking:
     def test_the_refusal_names_both_ways_out(self):
         with pytest.raises(ThinkingUnsupported) as excinfo:
             resolved_decoding_params(
-                SONNET_4_6, temperature=0.3, max_tokens=8192,
+                SONNET_4_6, sampling={"temperature": 0.3}, max_tokens=8192,
                 thinking=Thinking(mode=THINKING_ADAPTIVE))
         message = str(excinfo.value)
-        assert "drop the temperature" in message
+        assert "`temperature`" in message
+        assert "drop the sampling params" in message
         assert "disabled" in message
 
     def test_a_temperature_is_never_silently_dropped(self):
@@ -393,7 +394,7 @@ class TestSamplingParamsAndThinking:
         # someone "helpfully" makes it silent.
         try:
             dec = resolved_decoding_params(
-                SONNET_4_6, temperature=0.3, max_tokens=8192,
+                SONNET_4_6, sampling={"temperature": 0.3}, max_tokens=8192,
                 thinking=Thinking(mode=THINKING_ADAPTIVE))
         except ThinkingUnsupported:
             return
@@ -416,7 +417,7 @@ class TestEffortIsPartOfCallIdentity:
         return canonical_json(call_identity_fields(
             model,
             decoding_params=resolved_decoding_params(
-                model, temperature=None, max_tokens=8192,
+                model, max_tokens=8192,
                 thinking=thinking)))
 
     def test_two_efforts_fingerprint_differently(self):
@@ -460,7 +461,7 @@ class TestEffortIsPartOfCallIdentity:
         # block carries only the decoding keys it would carry anyway.
         block = call_identity_fields(
             OPUS_5, decoding_params=resolved_decoding_params(
-                OPUS_5, temperature=None, max_tokens=8192))
+                OPUS_5, max_tokens=8192))
         assert block["decoding_params"] == {"max_tokens": 8192}
 
     def test_model_default_thinking_is_not_folded_into_identity(self):
@@ -470,7 +471,7 @@ class TestEffortIsPartOfCallIdentity:
         assert thinking_support(OPUS_5).default_on is True
         block = call_identity_fields(
             OPUS_5, decoding_params=resolved_decoding_params(
-                OPUS_5, temperature=None, max_tokens=8192))
+                OPUS_5, max_tokens=8192))
         assert "thinking" not in block["decoding_params"]
 
 
@@ -640,12 +641,12 @@ class TestRegistryThinkingDeclarations:
         for model_id in (OPUS_5, OPUS_4_8, "claude-opus-4-7", SONNET_5,
                          SONNET_4_6):
             dec = resolved_decoding_params(
-                model_id, temperature=None, max_tokens=8192,
+                model_id, max_tokens=8192,
                 thinking=Thinking(mode=THINKING_ADAPTIVE,
                                   display="summarized"))
             assert dec["thinking"]["display"] == "summarized", model_id
         dec = resolved_decoding_params(
-            HAIKU_4_5, temperature=None, max_tokens=8192,
+            HAIKU_4_5, max_tokens=8192,
             thinking=Thinking(mode=THINKING_BUDGET, budget_tokens=2048,
                               display="summarized"))
         assert dec["thinking"]["display"] == "summarized"
