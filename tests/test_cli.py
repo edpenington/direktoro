@@ -41,6 +41,8 @@ class _StubAdapter:
         return self._response
 
 
+# Stands in for the parsed argparse namespace, which always carries every flag
+# it defines — `--temperature` included, whether or not the caller gave one.
 _ARGS = SimpleNamespace(max_tokens=2048, temperature=0.0)
 
 
@@ -155,7 +157,7 @@ class TestRetiredGate:
 class TestBuildRequest:
     def test_request_is_anthropic_shaped(self):
         request = cli.build_request(
-            "claude-opus-4-8", max_tokens=2048, temperature=0.0)
+            "claude-opus-4-8", max_tokens=2048, sampling={"temperature": 0.0})
         assert request["system"][0]["type"] == "text"
         assert request["messages"][0]["role"] == "user"
         assert request["tools"] == [cli.RECORD_ANSWER_TOOL]
@@ -164,14 +166,14 @@ class TestBuildRequest:
 
     def test_tool_choice_shaped_per_wire(self):
         responses_choice = cli.build_request(
-            "gpt-5.6-terra", max_tokens=1, temperature=0.0)["tool_choice"]
+            "gpt-5.6-terra", max_tokens=1, sampling={"temperature": 0.0})["tool_choice"]
         assert responses_choice == {
             "type": "function", "name": cli.TOOL_NAME}
         # A FORCING Chat Completions model (routed Qwen) rides the nested
         # `function` shape.
         chat_choice = cli.build_request(
             "qwen/qwen3-vl-235b-a22b-instruct",
-            max_tokens=1, temperature=0.0)["tool_choice"]
+            max_tokens=1, sampling={"temperature": 0.0})["tool_choice"]
         assert chat_choice == {
             "type": "function", "function": {"name": cli.TOOL_NAME}}
 
@@ -186,7 +188,7 @@ class TestBuildRequest:
         assert non_forcing, "no non-forcing entry to exercise the degrade"
         for m in non_forcing:
             choice = cli.build_request(
-                m, max_tokens=1, temperature=0.0)["tool_choice"]
+                m, max_tokens=1, sampling={"temperature": 0.0})["tool_choice"]
             assert choice == {"type": "auto"}, m
 
 

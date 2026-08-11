@@ -3,7 +3,8 @@
 Callers speak a single canonical request/response shape, and that shape is the
 Anthropic one: system as a list of text blocks, messages as content-block lists
 (`text` / `image` / `tool_use` / `tool_result`), tools with an `input_schema`,
-and decoding params named `max_tokens` / `temperature`. Nothing above the
+and decoding params named `max_tokens` plus whatever sampling controls the
+caller specified. Nothing above the
 adapter sees a provider wire format, which is what lets a caller store, resume,
 replay or render a conversation in one shape regardless of who served it.
 
@@ -27,7 +28,8 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from direktoro.registry import (
-    EFFORT_LEVELS, PROVIDER_ANTHROPIC, THINKING_ADAPTIVE, THINKING_BUDGET,
+    EFFORT_LEVELS, PROVIDER_ANTHROPIC, SAMPLING_PARAMS, THINKING_ADAPTIVE,
+    THINKING_BUDGET,
     THINKING_DISABLED, THINKING_DISPLAYS, THINKING_MODES,
     WIRE_CHAT_COMPLETIONS, WIRE_RESPONSES, model_info)
 from direktoro.routing import assert_served_upstream, provider_object
@@ -173,7 +175,7 @@ class NormalisedResponse:
     audit log. `wire_request` is the provider's actual wire request (None for
     Anthropic, where the two are the same). `decoding_params` records the
     decoding parameters actually sent after quirks were applied (for example
-    `temperature` omitted for models that reject it), so a stored record of the
+    sampling controls omitted for models that refuse them), so a stored record of the
     call is self-contained.
 
     The routing fields are populated only for gateway-served (OpenRouter)
@@ -492,13 +494,13 @@ def _thinking_params(model, info, thinking, *, max_tokens):
 _THINKING_ON_TYPES = ("adaptive", "enabled")
 
 
-def _refuse_sampling_with_thinking(model, thinking_params):
-    """Refuse `temperature` on a call that also turns thinking on.
+def _refuse_sampling_with_thinking(model, sending, thinking_params):
+    """Refuse sampling controls on a call that also turns thinking on.
 
     Anthropic's thinking documentation (read 2026-08-01): on Fable 5, Mythos 5,
     Opus 5, Opus 4.8, Opus 4.7 and Sonnet 5 a non-default `temperature` /
-    `top_p` / `top_k` is a 400 on EVERY request — that is the `no_temperature`
-    quirk, and those models never reach here with a temperature. "On older
+    `top_p` / `top_k` is a 400 on EVERY request — that is their
+    `rejects_sampling` declaration, and those models never reach here with one. "On older
     models, the restriction applies only while thinking is on: `temperature`
     and `top_k` are incompatible with thinking, and `top_p` is allowed at
     values between 0.95 and 1."
@@ -506,59 +508,85 @@ def _refuse_sampling_with_thinking(model, thinking_params):
     That per-CALL interaction is the one shape `ThinkingSupport` cannot express,
     because it is not a property of the model alone: Sonnet 4.6 and Haiku 4.5
     both accept a temperature, and both reject it once the same request asks
-    them to think. Resolving the two independently would emit
-    `{"temperature": 0.0, "thinking": {"type": "enabled", ...}}` — a 400 on a
-    paid call, from the layer whose stated job is to refuse those — so the pair
-    is checked here, where both halves of the request are known.
+    them to think. It is not a property of the parameter alone either, which is
+    why it lives here rather than beside `rejects_sampling`: that field answers
+    "does this endpoint take this control", a question with one answer per
+    (model, param), while this answers "may these two be sent together", which
+    has an answer only once both halves of the request are known. Resolving the
+    two independently would emit `{"temperature": 0.0, "thinking": {"type":
+    "enabled", ...}}` — a 400 on a paid call, from the layer whose stated job is
+    to refuse those.
 
-    REFUSED, not silently dropped, unlike `no_temperature`. There the model
+    `sending` is the sampling params this call would actually send, AFTER the
+    model's declared refusals have been applied: a param the endpoint drops
+    anyway is not a conflict, and naming it here would refuse a call that would
+    have worked.
+
+    REFUSED, not silently dropped, unlike a declared refusal. There the model
     never takes the parameter, so omitting it is the only honest rendering.
     Here the caller has asked for two things that cannot both hold and either
-    could be the one it cares about — dropping the temperature would change the
-    sampling distribution of a scientific run behind its back, and dropping the
-    thinking would change the reasoning. Naming both outs and stopping is the
-    only choice this layer is entitled to make.
+    could be the one it cares about — dropping the sampling control would change
+    the sampling distribution of a scientific run behind its back, and dropping
+    the thinking would change the reasoning. Naming both outs and stopping is
+    the only choice this layer is entitled to make.
     """
+    if not sending:
+        return
     block = thinking_params.get("thinking")
     if not block or block.get("type") not in _THINKING_ON_TYPES:
         return
+    named = ", ".join(f"`{k}`" for k in sorted(sending))
     raise ThinkingUnsupported(
-        f"model {model!r} accepts `temperature`, but not on a request that "
+        f"model {model!r} accepts {named}, but not on a request that "
         f"also turns thinking on ({block['type']!r}): on the 4.6-generation "
-        f"and earlier endpoints temperature is incompatible with active "
-        f"thinking and the pair returns a 400. Choose one — drop the "
-        f"temperature from this call to think, or ask for "
+        f"and earlier endpoints the sampling controls are incompatible with "
+        f"active thinking and the pair returns a 400. Choose one — drop the "
+        f"sampling params from this call to think, or ask for "
         f"Thinking(mode='disabled') / no thinking spec to keep sampling "
-        f"control. (The 4.7+ models settle it the other way: they reject "
-        f"temperature outright, so this layer already omits it for them.)")
+        f"control. (The 4.7+ models settle it the other way: they refuse the "
+        f"sampling controls outright, so this layer already omits them.)")
 
 
 # ---------------------------------------------------------------------------
 # Resolved decoding params (single source of truth)
 # ---------------------------------------------------------------------------
 
-def resolved_decoding_params(model, *, temperature, max_tokens, thinking=None):
+def resolved_decoding_params(model, *, max_tokens, sampling=None,
+                             thinking=None):
     """The decoding params the adapter will actually send for `model`.
 
     One source of truth shared by the adapters (so the wire request matches)
     and the recorded call identity (so a fingerprint folds in exactly what is
     sent, no more and no less). The output-token cap rides under the wire's
     key: `max_output_tokens` for the OpenAI Responses API, `max_tokens` for
-    Chat Completions and Anthropic. `temperature` is included only when the
-    model accepts it: the `no_temperature` quirk omits it (a reasoning model
-    that rejects only temperature), AND a model whose entry sets
-    `supports_sampling_params=False` omits it (a model whose provider dropped
-    ALL sampling controls, e.g. google/gemini-3.6-flash, whose Vertex endpoints
-    list neither temperature nor top_p). Either way the omission is honest: the
-    param is absent from BOTH the wire request built from this dict and the
-    fingerprint's decoding_params block folded from it, so editing a temperature
-    never moves the fingerprint of a model that will not accept it —
-    and the live require_parameters 404 stays the loud backstop if one ever leaks
-    through. (`top_p` is not emitted by this layer today; were it added it would
-    ride the same `supports_sampling_params` gate.) A `reasoning_effort` quirk is
-    included under the wire's key (`reasoning={"effort": ...}` for Responses,
-    `reasoning_effort` for Chat Completions), so editing that quirk moves the
-    fingerprint (it changes what is sent).
+    Chat Completions and Anthropic.
+
+    `sampling` is what the CALLER specified, as a mapping of names from
+    `SAMPLING_PARAMS` to values — `{"temperature": 0.0}`, `{"temperature": 0.2,
+    "top_p": 0.9}`, or None/`{}` for "specified nothing". A name is emitted only
+    when the caller gave it AND the model does not declare it refused
+    (`Model.rejects_sampling`). The four cases are deliberately distinct:
+
+      - specified, accepted    -> sent, and folded into call identity.
+      - specified, refused     -> absent from BOTH, so editing it never moves
+                                  the identity of a model that would not take
+                                  it. A caller that wants to tell its operator
+                                  the value was inert compares what it
+                                  specified against what this returns.
+      - unspecified, accepted  -> absent from both, and the PROVIDER's own
+                                  default applies. That default is the
+                                  provider's business and may change; this
+                                  layer neither pins nor records it, because
+                                  inventing a value here would claim a fact
+                                  nobody established.
+      - unspecified, refused   -> absent from both, and nothing to report.
+
+    A `reasoning_effort` quirk is included under the wire's key
+    (`reasoning={"effort": ...}` for Responses, `reasoning_effort` for Chat
+    Completions). It is REGISTRY-SUPPLIED rather than caller-specified (see
+    `Model`), so it is sent on every call to an entry that declares one and
+    folds into identity like anything else sent; editing that quirk moves the
+    fingerprint because it changes what is sent.
 
     `thinking` is an optional per-call `Thinking` spec (mode and/or reasoning
     effort). It defaults to None, which emits nothing and leaves each model's
@@ -581,20 +609,33 @@ def resolved_decoding_params(model, *, temperature, max_tokens, thinking=None):
     """
     info = model_info(model)
     quirks = info.quirks or {}
-    include_temp = (temperature is not None
-                    and not quirks.get("no_temperature")
-                    and info.supports_sampling_params)
+    # What the caller specified, minus what this endpoint refuses, in
+    # SAMPLING_PARAMS order so the emitted dict does not depend on the caller's
+    # key order or on set iteration. A None value reads as unspecified, so a
+    # caller may carry a fixed set of keys and leave the ones it has no opinion
+    # on empty.
+    asked = dict(sampling or {})
+    unknown = sorted(set(asked) - set(SAMPLING_PARAMS))
+    if unknown:
+        raise ValueError(
+            f"unknown sampling parameter(s) {unknown}; this layer emits "
+            f"{list(SAMPLING_PARAMS)}. A name it does not know would be "
+            f"silently dropped from both the wire and the recorded identity.")
+    sending = {name: asked[name] for name in SAMPLING_PARAMS
+               if asked.get(name) is not None
+               and name not in info.rejects_sampling}
     effort = quirks.get("reasoning_effort")
     thinking_params = _thinking_params(
         model, info, thinking, max_tokens=max_tokens)
 
     if info.provider == PROVIDER_ANTHROPIC:
         dec = {"max_tokens": max_tokens}
-        if include_temp:
-            # Sampling x thinking is a per-CALL interaction, not a per-model
-            # one, so it is checked here rather than in `_thinking_params`.
-            _refuse_sampling_with_thinking(model, thinking_params)
-            dec["temperature"] = temperature
+        # Sampling x thinking is a per-CALL interaction, not a per-model one,
+        # so it is checked here rather than in `_thinking_params` — and against
+        # what would actually be SENT, so a param the endpoint drops anyway
+        # never refuses a call that would have worked.
+        _refuse_sampling_with_thinking(model, sending, thinking_params)
+        dec.update(sending)
         dec.update(thinking_params)
         return dec
 
@@ -602,16 +643,14 @@ def resolved_decoding_params(model, *, temperature, max_tokens, thinking=None):
         dec = {"max_tokens": max_tokens}
         if effort:
             dec["reasoning_effort"] = effort
-        if include_temp:
-            dec["temperature"] = temperature
+        dec.update(sending)
         return dec
 
     # OpenAI Responses.
     dec = {"max_output_tokens": max_tokens}
     if effort:
         dec["reasoning"] = {"effort": effort}
-    if include_temp:
-        dec["temperature"] = temperature
+    dec.update(sending)
     return dec
 
 
@@ -624,7 +663,8 @@ class AnthropicAdapter:
 
     The canonical request already IS the Anthropic wire request, so this
     adapter only applies the model's decoding quirks (Opus 4.7+ reject
-    `temperature`), streams the call, and normalises the SDK response object.
+    the sampling controls), streams the call, and normalises the SDK response
+    object.
     """
 
     provider = PROVIDER_ANTHROPIC
@@ -634,17 +674,17 @@ class AnthropicAdapter:
         self.base_url = base_url
 
     def create_message(self, *, model, system, messages, max_tokens,
-                       tools=None, tool_choice=None, temperature=None,
+                       tools=None, tool_choice=None, sampling=None,
                        thinking=None):
-        # Opus 4.7+ reject `temperature`; the resolver omits it so the wire and
-        # the recorded decoding params reflect exactly what was sent. Its keys
-        # (max_tokens, temperature when accepted, and `thinking` /
+        # Opus 4.7+ refuse the sampling controls; the resolver omits a refused
+        # one so the wire and the recorded decoding params reflect exactly what
+        # was sent. Its keys (max_tokens, the accepted sampling controls, and `thinking` /
         # `output_config` when a Thinking spec was passed) are already Anthropic
         # wire keys, so they merge straight into the wire request. `thinking`
         # defaults to None: omit it and the request carries no thinking
         # parameters at all, leaving the model's own default in force.
         decoding = resolved_decoding_params(
-            model, temperature=temperature, max_tokens=max_tokens,
+            model, sampling=sampling, max_tokens=max_tokens,
             thinking=thinking)
         wire = {
             "model": model,
@@ -791,7 +831,7 @@ class OpenAIAdapter:
         self.base_url = base_url
 
     def create_message(self, *, model, system, messages, max_tokens,
-                       tools=None, tool_choice=None, temperature=None,
+                       tools=None, tool_choice=None, sampling=None,
                        thinking=None):
         # `thinking` is accepted so the adapter interface is uniform across
         # providers, but the seam emits Anthropic wire keys and the OpenAI
@@ -809,14 +849,14 @@ class OpenAIAdapter:
             canonical["tools"] = tools
         if tool_choice is not None:
             canonical["tool_choice"] = tool_choice
-        if temperature is not None:
-            canonical["temperature"] = temperature
+        canonical.update({k: v for k, v in (sampling or {}).items()
+                         if v is not None})
 
         if info.wire_api == WIRE_CHAT_COMPLETIONS:
             wire, decoding = _to_chat_completions_wire(
                 model=model, system=system, messages=messages, tools=tools,
                 tool_choice=tool_choice, max_tokens=max_tokens,
-                temperature=temperature, thinking=thinking)
+                sampling=sampling, thinking=thinking)
             route = info.route
             if route is not None:
                 # Gateway-served: emit OpenRouter's provider routing object and
@@ -842,7 +882,7 @@ class OpenAIAdapter:
         wire, decoding = _to_openai_wire(
             model=model, system=system, messages=messages, tools=tools,
             tool_choice=tool_choice, max_tokens=max_tokens,
-            temperature=temperature, thinking=thinking)
+            sampling=sampling, thinking=thinking)
 
         try:
             response = self._client.responses.create(**wire)
@@ -1167,14 +1207,14 @@ def _chat_stop_reason(finish_reason, has_tool_call):
 
 
 def _to_chat_completions_wire(*, model, system, messages, tools, tool_choice,
-                              max_tokens, temperature, thinking=None):
+                              max_tokens, sampling=None, thinking=None):
     """Translate a canonical Anthropic-shaped request to Chat Completions wire
     kwargs (the gateway-served GLM / Qwen path).
 
     Returns `(wire, decoding)` where `decoding` is the subset of decoding
     params actually sent (from `resolved_decoding_params`, which a caller
     records for provenance and folds into call identity). Its keys
-    (`max_tokens`, `reasoning_effort`, `temperature` when accepted) are already
+    (`max_tokens`, `reasoning_effort`, the sampling controls when accepted) are already
     Chat Completions wire keys, so they merge straight into the wire request.
     Pure: no network, no SDK, so it is unit-tested directly. The output-token
     cap rides under `max_tokens` (the classic Chat Completions key), which the
@@ -1185,7 +1225,7 @@ def _to_chat_completions_wire(*, model, system, messages, tools, tool_choice,
     non-Anthropic model is refused there rather than silently dropped here.
     """
     decoding = resolved_decoding_params(
-        model, temperature=temperature, max_tokens=max_tokens,
+        model, sampling=sampling, max_tokens=max_tokens,
         thinking=thinking)
     wire = {
         "model": model,
@@ -1309,20 +1349,20 @@ def _blocks_to_chat_messages(role, blocks):
 
 
 def _to_openai_wire(*, model, system, messages, tools, tool_choice,
-                    max_tokens, temperature, thinking=None):
+                    max_tokens, sampling=None, thinking=None):
     """Translate a canonical Anthropic-shaped request to Responses wire kwargs.
 
     Returns `(wire, decoding)` where `decoding` is the subset of decoding
     params actually sent (from `resolved_decoding_params`, which a caller
     records for provenance and folds into call identity). Its keys
-    (`max_output_tokens`, `reasoning`, `temperature` when accepted) are already
+    (`max_output_tokens`, `reasoning`, the sampling controls when accepted) are already
     Responses wire keys, so they merge straight into the wire request. Pure: no
     network, no SDK, so it is unit-tested directly. `thinking` is threaded to
     the resolver only so a spec aimed at a non-Anthropic model is refused there
     rather than silently dropped here.
     """
     decoding = resolved_decoding_params(
-        model, temperature=temperature, max_tokens=max_tokens,
+        model, sampling=sampling, max_tokens=max_tokens,
         thinking=thinking)
     wire = {
         "model": model,

@@ -245,16 +245,27 @@ def thinking_from_args(args):
     return Thinking(mode=mode, effort=effort, budget_tokens=budget)
 
 
-def build_request(model_id, *, max_tokens, temperature, thinking=None):
+def _sampling_from_args(args):
+    """The sampling controls this invocation specified, as a mapping.
+
+    One flag today (`--temperature`), and absent unless given: the smoke run's
+    job is to exercise what a caller asked for, so an unasked-for control is
+    left to the model's own default rather than pinned to a value nobody
+    chose. A second flag would add a key here and nothing else.
+    """
+    return {"temperature": args.temperature}
+
+
+def build_request(model_id, *, max_tokens, sampling=None, thinking=None):
     """The canonical request kwargs for one model, ready to splat into
     adapter.create_message. Anthropic-shaped throughout except tool_choice,
     which `tool_choice_named` shapes per wire protocol.
 
-    `temperature` and `thinking` are each omitted ENTIRELY when None, rather
-    than sent as a null: an absent key is what "leave the model's own default in
-    force" looks like on the wire, and it is also what the printed request
-    should show, since a `"temperature": null` in a dry run reads as a
-    parameter being sent when none is."""
+    An unspecified sampling control and an unspecified `thinking` are each
+    omitted ENTIRELY rather than sent as a null: an absent key is what "leave
+    the model's own default in force" looks like on the wire, and it is also
+    what the printed request should show, since a `"temperature": null` in a
+    dry run reads as a parameter being sent when none is."""
     request = {
         "model": model_id,
         "system": [{"type": "text", "text": SYSTEM_TEXT}],
@@ -263,8 +274,8 @@ def build_request(model_id, *, max_tokens, temperature, thinking=None):
         "tool_choice": tool_choice_named(model_id, TOOL_NAME),
         "max_tokens": max_tokens,
     }
-    if temperature is not None:
-        request["temperature"] = temperature
+    request.update({k: v for k, v in (sampling or {}).items()
+                    if v is not None})
     if thinking is not None:
         request["thinking"] = thinking
     return request
@@ -316,7 +327,7 @@ def run_dry(models, args):
               f"base_url: {info.base_url}")
         try:
             resolved = resolved_decoding_params(
-                model_id, temperature=args.temperature,
+                model_id, sampling=_sampling_from_args(args),
                 max_tokens=args.max_tokens, thinking=thinking)
         except ThinkingUnsupported as e:
             refused += 1
@@ -325,7 +336,7 @@ def run_dry(models, args):
             continue
         request = build_request(
             model_id, max_tokens=args.max_tokens,
-            temperature=args.temperature, thinking=thinking)
+            sampling=_sampling_from_args(args), thinking=thinking)
         print(f"    resolved decoding params: {json.dumps(resolved)}")
         print(json.dumps(_jsonable(request), indent=2, ensure_ascii=False))
         print()
@@ -355,7 +366,8 @@ def call_one(label, model_id, args):
         return row
 
     request = build_request(
-        model_id, max_tokens=args.max_tokens, temperature=args.temperature,
+        model_id, max_tokens=args.max_tokens,
+        sampling=_sampling_from_args(args),
         thinking=thinking_from_args(args))
 
     t0 = time.monotonic()

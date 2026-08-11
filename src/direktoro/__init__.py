@@ -69,7 +69,8 @@ from direktoro.registry import (
     model_info,
     model_supports_images,
     supports_forced_tool_choice,
-    supports_sampling_params,
+    SAMPLING_PARAMS,
+    rejected_sampling_params,
     thinking_support,
 )
 from direktoro.routing import (
@@ -95,7 +96,7 @@ from direktoro.batch import (
 # here and nowhere else: this version can end up inside a caller's own
 # call-identity fingerprint, so a bump moves published provenance and must be
 # deliberate. `tests/test_public_api.py` asserts the wiring.
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "__version__",
@@ -185,7 +186,8 @@ __all__ = [
     # controls (temperature/top_p)? False for google/gemini-3.6-flash, whose
     # Vertex endpoints dropped them; resolved_decoding_params omits an
     # unaccepted sampling param from wire AND fingerprint.
-    "supports_sampling_params",
+    "SAMPLING_PARAMS",
+    "rejected_sampling_params",
     # Provider / wire constants. Three providers, which is every value a
     # registry entry can carry and every value `call_identity_fields` can
     # report. The two pinned base URLs are here for the same reason the

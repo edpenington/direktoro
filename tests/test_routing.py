@@ -156,7 +156,7 @@ class TestCallIdentityFields:
         from direktoro.providers import resolved_decoding_params
 
         resolved = resolved_decoding_params(
-            "google/gemini-3.6-flash", temperature=0.0, max_tokens=8)
+            "google/gemini-3.6-flash", sampling={"temperature": 0.0}, max_tokens=8)
         assert "temperature" not in resolved
         fields = call_identity_fields(
             "google/gemini-3.6-flash", decoding_params=resolved)
@@ -167,7 +167,7 @@ class TestCallIdentityFields:
         no_temp = call_identity_fields(
             "google/gemini-3.6-flash",
             decoding_params=resolved_decoding_params(
-                "google/gemini-3.6-flash", temperature=None, max_tokens=8))
+                "google/gemini-3.6-flash", max_tokens=8))
         assert canonical_json(fields) == canonical_json(no_temp)
 
 

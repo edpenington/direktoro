@@ -21,8 +21,8 @@ from direktoro.providers import (
     tool_choice_named,
 )
 from direktoro.registry import (
-    PROVIDER_OPENROUTER, model_info, supports_forced_tool_choice,
-    supports_sampling_params)
+    PROVIDER_OPENROUTER, SAMPLING_PARAMS, model_info,
+    rejected_sampling_params, supports_forced_tool_choice)
 
 
 class TestToolChoiceNamed:
@@ -74,30 +74,40 @@ class TestSupportsForcedToolChoicePredicate:
             supports_forced_tool_choice("totally-made-up-model-9000")
 
 
-class TestSupportsSamplingParamsPredicate:
-    """The sampling-params capability seam, mirroring the forced-tool-choice
-    predicate. True for every model that lists the sampling controls; False only
-    for google/gemini-3.6-flash, whose Vertex endpoints list neither temperature
-    nor top_p."""
+class TestRejectedSamplingParamsPredicate:
+    """The sampling-refusal seam, mirroring the forced-tool-choice predicate.
+    It reports DECLARED REFUSALS, so an empty set is both "takes them all" and
+    "nobody established otherwise" — the two are the same instruction to a
+    caller, which is to send what it was given and let the endpoint answer."""
 
-    def test_true_for_normal_models(self):
-        # Anthropic (even a no_temperature reasoning model still counts as
-        # sampling-capable at the registry level — the quirk is the finer gate),
-        # OpenAI, and the other routed models all take sampling params.
-        for m in ("claude-haiku-4-5-20251001", "claude-opus-4-8", "gpt-5.6-sol",
+    def test_empty_for_models_that_declare_no_refusal(self):
+        for m in ("claude-haiku-4-5-20251001", "claude-sonnet-4-6",
                   "qwen/qwen3-vl-235b-a22b-instruct", "xiaomi/mimo-v2.5",
                   "z-ai/glm-4.6v"):
-            assert supports_sampling_params(m) is True, m
-            assert model_info(m).supports_sampling_params is True, m
+            assert rejected_sampling_params(m) == frozenset(), m
+            assert model_info(m).rejects_sampling == frozenset(), m
 
-    def test_false_for_gemini_36(self):
-        assert supports_sampling_params("google/gemini-3.6-flash") is False
-        assert model_info(
-            "google/gemini-3.6-flash").supports_sampling_params is False
+    def test_the_whole_set_for_the_4_7_generation(self):
+        # The Claude model reference lists all three as removed for this family.
+        for m in ("claude-opus-5", "claude-opus-4-8", "claude-opus-4-7",
+                  "claude-sonnet-5"):
+            assert rejected_sampling_params(m) == frozenset(SAMPLING_PARAMS), m
+
+    def test_just_temperature_for_the_gpt_reasoning_entries(self):
+        # Their documentation establishes temperature and says nothing about
+        # the other two, so the entry claims only what it can.
+        assert rejected_sampling_params("gpt-5.6-sol") == frozenset(
+            {"temperature"})
+
+    def test_temperature_and_top_p_for_gemini_36(self):
+        assert rejected_sampling_params("google/gemini-3.6-flash") == frozenset(
+            {"temperature", "top_p"})
+        assert model_info("google/gemini-3.6-flash").rejects_sampling == \
+            frozenset({"temperature", "top_p"})
 
     def test_unknown_model_raises(self):
         with pytest.raises(ValueError):
-            supports_sampling_params("totally-made-up-model-9000")
+            rejected_sampling_params("totally-made-up-model-9000")
 
 
 class TestForcedToolChoiceDegrade:
