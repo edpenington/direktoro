@@ -71,6 +71,7 @@ from direktoro.registry import (
     supports_forced_tool_choice,
     SAMPLING_PARAMS,
     rejected_sampling_params,
+    sampling_band,
     thinking_support,
 )
 from direktoro.routing import (
@@ -178,9 +179,8 @@ __all__ = [
     # consumer that records which bytes produced a run alongside which release.
     "source_hash",
     # Capability predicate: does the model's endpoint honour a forced named
-    # tool_choice? False for the two routed GLM vision endpoints and for MiMo,
-    # whose hosts 404 a forced choice for those slugs; consumers arm their
-    # auto-degrade retry off it.
+    # tool_choice? Stated per entry, never defaulted; a consumer arms its
+    # auto-degrade retry off a False.
     "supports_forced_tool_choice",
     # Capability predicate: does the model's endpoint accept the sampling
     # controls (temperature/top_p)? False for google/gemini-3.6-flash, whose
@@ -188,6 +188,10 @@ __all__ = [
     # unaccepted sampling param from wire AND fingerprint.
     "SAMPLING_PARAMS",
     "rejected_sampling_params",
+    # Capability lookup: the (low, high) range documented for one sampling
+    # param — the model's own reference for a direct entry, its gateway's
+    # request surface for a routed one — or None where none is established.
+    "sampling_band",
     # Provider / wire constants. Three providers, which is every value a
     # registry entry can carry and every value `call_identity_fields` can
     # report. The two pinned base URLs are here for the same reason the

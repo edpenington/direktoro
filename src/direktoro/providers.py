@@ -1554,11 +1554,11 @@ def tool_choice_named(model_id, tool_name):
     and the Chat Completions nested `function`. All three shapes are
     live-validated against their endpoints by `direktoro.cli`'s smoke run.
 
-    A model whose registry entry sets `forced_tool_choice=False` (the two routed
-    GLM vision endpoints, whose Z.AI host 404s a forced tool_choice through
-    OpenRouter — confirmed live 2026-07-23) cannot be forced at all, so this
-    returns the wire's "auto" form (`{"type": "auto"}`, which every adapter
-    normalises to its provider's auto vocabulary) instead of a forced value. A
+    A model whose registry entry states `forced_tool_choice=False` (each such
+    entry records the probe that established it) cannot be forced at all, so
+    this returns the wire's "auto" form (`{"type": "auto"}`, which every
+    adapter normalises to its provider's auto vocabulary) instead of a forced
+    value. A
     call site that does `tool_choice_named(model, name)` and passes the result
     to `adapter.create_message` therefore degrades to auto with no code change
     of its own; it consults `supports_forced_tool_choice` separately to arm the

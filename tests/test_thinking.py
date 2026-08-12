@@ -253,6 +253,7 @@ class TestRefusesShapesTheModelWouldReject:
         monkeypatch.setitem(
             MODEL_REGISTRY, "synthetic-no-display",
             Model("anthropic", None, "ANTHROPIC_API_KEY",
+                  forced_tool_choice=True,
                   thinking=ThinkingSupport(
                       modes=(THINKING_ADAPTIVE,), efforts=("high",),
                       default_effort="high", displays=())))
@@ -274,6 +275,7 @@ class TestRefusesShapesTheModelWouldReject:
         monkeypatch.setitem(
             MODEL_REGISTRY, "synthetic-omitted-only",
             Model("anthropic", None, "ANTHROPIC_API_KEY",
+                  forced_tool_choice=True,
                   thinking=ThinkingSupport(
                       modes=(THINKING_ADAPTIVE,), efforts=("high",),
                       default_effort="high", displays=("omitted",))))

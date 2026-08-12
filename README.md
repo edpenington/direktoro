@@ -291,17 +291,24 @@ so the registry says which is which rather than blurring them:
 - **The five routed entries** rest on **live endpoint probes** — the gateway's
   `/models` and `/endpoints` listings for served upstream, quantization and
   supported parameters, then a real plain / tool / vision call against the
-  pinned endpoint. Dated 2026-07-23 and 2026-07-24. These are observations.
+  pinned endpoint. These are observations. One narrow exception: a routed
+  entry's sampling band records the gateway's own documented request range,
+  because a continuous range is not a thing a probe can establish.
 - **The eleven direct entries** rest on the vendor's **published model
   reference** — the model and deprecation tables, the migration guide, the
-  thinking documentation — read on 2026-07-31 and 2026-08-01. These are
-  documentation facts. No Anthropic or OpenAI endpoint was called to watch it
-  accept or reject a parameter.
+  thinking documentation, the API reference. These are documentation facts.
+  No Anthropic or OpenAI endpoint was called to watch it accept or reject a
+  parameter.
+
+Every value's comment carries the date its evidence was read or probed; the
+dates currently in the table run from 2026-07-23 to 2026-08-12.
 
 A value left at its field default records nothing at all. `supports_images` is
 the one to know about: the routed entries set it because a probe sent an image,
 while every direct entry takes the default `True`, which stands on the published
-reference like the rest of its row.
+reference like the rest of its row. `forced_tool_choice` has no default at
+all — every entry states it, with its basis beside it — so that reading rule
+cannot arise for it.
 
 What is still forbidden is copying a flag across because the entry above it sets
 the same one. Families are not uniform — two upstreams serving one slug can

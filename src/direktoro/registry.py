@@ -65,17 +65,20 @@ rather than blurred:
 
   - DIRECT entries (Anthropic, OpenAI) are read from the vendor's own PUBLISHED
     MODEL REFERENCE — the model and deprecation tables, the migration guide, the
-    thinking documentation — and the comment beside the value names the date
-    that reference was read (2026-07-31 and 2026-08-01 for everything currently
-    in the table). These are documentation facts. Nothing in this half of the
-    table was established by calling an endpoint and watching it accept or
-    reject a parameter.
+    thinking documentation, the API reference — and the comment beside the
+    value names the date that reference was read (the reads currently in the
+    table are from 2026-07-31, 2026-08-01 and 2026-08-12). These are
+    documentation facts. Nothing in this half of the table was established by
+    calling an endpoint and watching it accept or reject a parameter.
   - ROUTED entries (OpenRouter) are read from LIVE ENDPOINT PROBES: GET
     /api/v1/models and /endpoints for the served upstream, quantization and
     supported_parameters, then a real plain / tool / vision call against the
-    pinned endpoint. The comment beside the value names what was probed and when
-    (2026-07-23 and 2026-07-24 for everything currently in the table). These are
-    the observations in this file; the direct half has none.
+    pinned endpoint. The comment beside the value names what was probed and
+    when. These are the observations in this file; the direct half has none.
+    One narrow exception: a routed entry's `sampling_bands` describe the
+    GATEWAY's own documented request surface — the range OpenRouter itself
+    accepts — because a continuous range is not a thing a probe can establish;
+    the band's comment says so.
 
 Either way the evidence travels with the value: the comment beside it is the
 evidence, not decoration, so it moves with the value and is rewritten only when
@@ -86,6 +89,9 @@ read as one. `supports_images` is the case that matters: the five routed entries
 set it explicitly because a probe actually sent an image, while all eleven
 direct entries simply take the default True, which stands on the published model
 reference like the rest of their row and on no probe at all.
+`forced_tool_choice` closes that gap the other way: it has no working default
+at all, so an unstated value is a construction error rather than a silent
+claim, and every entry carries the flag with its basis beside it.
 
 A family constant (`_NO_SAMPLING`, `_EFFORTS_4_7`, `_THINK_OPUS_4_7`, ...) is shared
 between entries because the published reference states the fact per FAMILY, and
@@ -134,8 +140,10 @@ design — provenance must not break — and is precisely why the question has t
 askable.
 """
 
+import math
 from dataclasses import dataclass, field
-from typing import Optional
+from types import MappingProxyType
+from typing import Mapping, Optional
 
 from direktoro.routing import GATEWAY_OPENROUTER, Route
 
@@ -376,15 +384,13 @@ class Model:
 
     `forced_tool_choice` declares whether the model's endpoint honours a
     FORCED / named / "required" tool_choice (one that names a specific tool the
-    model MUST call). True for every direct endpoint and for two of the five
-    routed entries (the Qwen flagship and Gemini 3.6 Flash), whose values come
-    from dated live forced-tool probes recorded in their entries; the direct
-    values rest on the vendors' published tool-use documentation, not on a
-    probe. False for three routed entries — the two GLM vision endpoints, whose
-    Z.AI host 404s a forced tool_choice through OpenRouter, and MiMo, one of
-    whose two pinned hosts does the same (both confirmed live 2026-07-23; see
-    the entry comments): only tool_choice "auto" routes for those, under which
-    the model MAY decline to call the tool.
+    model MUST call). False means only tool_choice "auto" routes, under which
+    the model MAY decline to call the tool. The flag has NO default: whether an
+    endpoint honours forcing was either established or it was not, and a
+    default in either direction asserts the unestablished — a wrong True is a
+    404 on a paid call, a wrong False silently makes the auto + retry path the
+    normal one. Every entry states it, with its basis beside the value per HOW
+    A FACT GETS INTO THIS TABLE.
     `tool_choice_named` reads this flag and emits the wire's "auto" form
     for a non-forcing model, so a call site that forces a named tool degrades to
     auto without changing its code; a caller arms its own bounded validate/retry
@@ -418,6 +424,21 @@ class Model:
     `rejected_sampling_params` accessor (mirrors `supports_forced_tool_choice`);
     like it, the declaration reaches call identity only through
     `resolved_decoding_params` dropping the param, never on its own.
+
+    `sampling_bands` declares, per sampling param, the (low, high) value range
+    its reference documents as accepted — the model's own reference for a
+    direct entry, its gateway's request surface for a routed one (see HOW A
+    FACT GETS INTO THIS TABLE) — so a value outside it CAN be refused before
+    the call is billed rather than 400ing on the first paid request. An
+    absent band is an honest absence — no range has been established, and the
+    value is sent for the endpoint's own answer to settle — and a declared
+    band never claims everything inside it succeeds; the endpoint's own
+    rejection stays the loud backstop for an in-band value it happens to
+    dislike. A band for a param the entry `rejects_sampling` is refused at
+    import: the endpoint cannot both refuse a param outright and accept a
+    range of it. Read via the `sampling_band` accessor; handed out as a
+    read-only mapping, because a recorded fact is not something a reader can
+    edit in place.
 
     `retired` marks an id the provider has withdrawn: the entry is kept so past
     runs still resolve against it, but it must never start a NEW run (a live
@@ -456,7 +477,8 @@ class Model:
     `temperature`, never on its own.
 
     ADDING A FIELD: APPEND IT AT THE END.
-    A new field goes after `thinking`, with a default, and nowhere else. This
+    A new field goes after the LAST field (today `sampling_bands`), with a
+    default, and nowhere else. This
     record is constructed POSITIONALLY — every entry in `MODEL_REGISTRY` passes
     provider / base_url / api_key_env positionally, this package's own tests
     construct `Model(...)` the same way, and so does anything downstream that
@@ -464,7 +486,12 @@ class Model:
     of those positional arguments to the attribute after it, silently and
     without a TypeError: a base URL lands in `api_key_env`, a key env lands in
     `quirks`. Appending is the only edit that cannot do that, and a default is
-    what keeps existing constructions valid.
+    what keeps existing constructions positionally valid.
+    `forced_tool_choice` deliberately trades the second half of that away:
+    its None default is a sentinel the constructor refuses, so every
+    construction — registry entry or synthetic — must state the flag. A new
+    field must not repeat that trade without the same grade of justification,
+    because each sentinel breaks every existing downstream construction once.
     `tests/test_cost.py::TestModelFieldOrder` pins the order so the rule fails
     loudly rather than being remembered.
     """
@@ -475,11 +502,15 @@ class Model:
     quirks: dict = field(default_factory=dict)
     wire_api: str = WIRE_RESPONSES
     supports_images: bool = True
-    forced_tool_choice: bool = True
+    # None is a sentinel, not a value: construction refuses it in
+    # __post_init__. The field keeps a "default" only so the positional
+    # append-only rule holds (see ADDING A FIELD below).
+    forced_tool_choice: Optional[bool] = None
     rejects_sampling: frozenset = frozenset()
     retired: bool = False
     route: Optional[Route] = None
     thinking: Optional[ThinkingSupport] = None
+    sampling_bands: Mapping[str, tuple] = field(default_factory=dict)
 
     def __post_init__(self):
         # Routing (provider-object emission, pin assertion, reported-cost
@@ -508,6 +539,59 @@ class Model:
             raise ValueError(
                 f"rejects_sampling names {unknown}, which are not sampling "
                 f"parameters; it accepts {list(SAMPLING_PARAMS)}.")
+        # Whether an endpoint honours a forced tool_choice was either
+        # established or it was not, and a default in either direction would
+        # assert the unestablished — so there is no working default and every
+        # entry states the flag, with its basis in the entry's comment. The
+        # SHAPE is checked too: the record is reachable positionally, and a
+        # truthy non-bool ("yes", "false") read as True would force a named
+        # tool on an endpoint that 404s one — the paid failure the statement
+        # requirement exists to prevent.
+        if not isinstance(self.forced_tool_choice, bool):
+            raise ValueError(
+                "Model.forced_tool_choice must be stated as a bool: True "
+                "(the endpoint honours a forced / named tool_choice) or "
+                'False (only "auto" routes). There is no default; record the '
+                "basis — vendor documentation or a dated probe — beside the "
+                f"value. Got {self.forced_tool_choice!r}.")
+        # Same positional exposure, same shape rule as `rejects_sampling`:
+        # the wrong container is refused at import, not read for whatever
+        # `.items()` it happens to lack.
+        if not isinstance(self.sampling_bands, (dict, MappingProxyType)):
+            raise TypeError(
+                f"sampling_bands must be a dict of sampling parameter names "
+                f"to (low, high) tuples, got "
+                f"{type(self.sampling_bands).__name__}.")
+        for param, band in self.sampling_bands.items():
+            if param not in SAMPLING_PARAMS:
+                raise ValueError(
+                    f"sampling_bands names {param!r}, which is not a sampling "
+                    f"parameter; it accepts {list(SAMPLING_PARAMS)}.")
+            if param in self.rejects_sampling:
+                raise ValueError(
+                    f"sampling_bands declares a band for {param!r}, which "
+                    f"rejects_sampling says the endpoint refuses outright; "
+                    f"one of the two declarations is wrong. (A synthetic "
+                    f"entry built with dataclasses.replace must adjust both "
+                    f"fields together.)")
+            # NaN never compares, so a NaN bound would satisfy `low <= high`
+            # vacuously and then fail EVERY later range test; an infinite
+            # bound declares a fact while claiming nothing. Both are refused
+            # as malformed, not recorded.
+            if (not isinstance(band, tuple) or len(band) != 2
+                    or not all(isinstance(b, (int, float))
+                               and not isinstance(b, bool)
+                               and math.isfinite(b) for b in band)
+                    or band[0] > band[1]):
+                raise ValueError(
+                    f"sampling_bands[{param!r}] must be a (low, high) tuple "
+                    f"of finite numbers with low <= high, got {band!r}.")
+        # A band is a recorded documented fact, so it is not handed out
+        # mutable: the mapping is copied and frozen here, and every reader
+        # gets the same read-only view. (`rejects_sampling` gets this for
+        # free from being a frozenset; a mapping needs it done by hand.)
+        object.__setattr__(self, "sampling_bands",
+                           MappingProxyType(dict(self.sampling_bands)))
 
 
 # The sampling controls a caller may specify, and the only names
@@ -527,6 +611,19 @@ _NO_SAMPLING = frozenset(SAMPLING_PARAMS)
 # neither is named. `rejects_sampling` claims refusals only, so an unestablished
 # one is sent and the endpoint's own answer settles it.
 _NO_TEMPERATURE = frozenset({"temperature"})
+
+# Anthropic documents temperature "0.0 to 1.0" and publishes no numeric range
+# for top_p or top_k (Messages API reference, read 2026-08-12) — one
+# documented API-wide fact, recorded once and shared by the live entries that
+# still take sampling, rather than transcribed per row.
+_ANTHROPIC_SAMPLING_BANDS = {"temperature": (0.0, 1.0)}
+
+# OpenRouter documents temperature 0.0 to 2.0 and top_p 0.0 to 1.0 for its
+# request surface; top_k is documented one-sided ("0 or above"), which a
+# (low, high) band cannot state, so none is declared (gateway API reference,
+# read 2026-08-12). One documented gateway fact, shared by the routed entries
+# that take sampling — see the SAMPLING BANDS note in the routed section.
+_OPENROUTER_SURFACE_BANDS = {"temperature": (0.0, 2.0), "top_p": (0.0, 1.0)}
 
 # ---- Thinking / effort capability presets --------------------------------
 # Anthropic model reference + migration guide, verified 2026-07-31. These are
@@ -599,6 +696,18 @@ MODEL_REGISTRY = {
     # pointer. The routed GLM / Qwen slugs remain the genuinely rolling case
     # (see the module docstring).
     #
+    # FORCED TOOL_CHOICE (every LIVE Anthropic entry below): the Messages API
+    # documents `tool_choice: {"type": "tool", "name": ...}` — "the model will
+    # use the specified tool" — with no per-model carve-out (API reference,
+    # read 2026-08-12), so each live entry states forced_tool_choice=True on
+    # that documentation. The three RETIRED entries state True on a weaker
+    # basis, said plainly: the same tool_choice documentation applied to them
+    # while they were live and predates their retirements, but a withdrawn
+    # endpoint cannot be re-verified, and the current reference no longer
+    # describes it. The flag must still be stated (there is no default), the
+    # new-run gate keeps it unreachable, and the weaker evidence class is the
+    # honest price of that combination.
+    #
     # Opus 5. Context 1M (default and maximum), max output 128K. Rejects
     # temperature/top_p/top_k like the rest of the 4.7+ family (non-default
     # values return 400). THINKING: adaptive is ON when the `thinking` param is
@@ -611,12 +720,14 @@ MODEL_REGISTRY = {
     # verified against the published model and deprecation tables 2026-07-31.
     "claude-opus-5": Model(
         PROVIDER_ANTHROPIC, None, ANTHROPIC_KEY_ENV,
+        forced_tool_choice=True,
         rejects_sampling=_NO_SAMPLING, thinking=_THINK_OPUS_5),
     # Opus 4.8. Context 1M, max output 128K. Adaptive thinking is the only
     # on-mode and is OFF when the `thinking` param is omitted. Verified
     # 2026-07-31.
     "claude-opus-4-8": Model(
         PROVIDER_ANTHROPIC, None, ANTHROPIC_KEY_ENV,
+        forced_tool_choice=True,
         rejects_sampling=_NO_SAMPLING, thinking=_THINK_OPUS_4_7),
     # Opus 4.7. Context 1M, max output 128K. Same thinking surface as 4.8 — one
     # documented family fact shared via `_THINK_OPUS_4_7` (Anthropic model
@@ -624,6 +735,7 @@ MODEL_REGISTRY = {
     # from the neighbouring row.
     "claude-opus-4-7": Model(
         PROVIDER_ANTHROPIC, None, ANTHROPIC_KEY_ENV,
+        forced_tool_choice=True,
         rejects_sampling=_NO_SAMPLING, thinking=_THINK_OPUS_4_7),
     # Sonnet 5. Context 1M, max output 128K. Dateless 4.6-generation id, i.e. a
     # pinned snapshot (see the snapshot note above), so it is citation-grade as
@@ -635,6 +747,7 @@ MODEL_REGISTRY = {
     # the first Sonnet with `xhigh`.
     "claude-sonnet-5": Model(
         PROVIDER_ANTHROPIC, None, ANTHROPIC_KEY_ENV,
+        forced_tool_choice=True,
         rejects_sampling=_NO_SAMPLING, thinking=_THINK_SONNET_5),
     # Sonnet 4.6. Context 1M, max output 128K. Takes sampling params (no
     # refusals). Adaptive thinking is OFF when the param is omitted;
@@ -642,7 +755,9 @@ MODEL_REGISTRY = {
     # effort ladder stops at `max` (no `xhigh` before Opus 4.7).
     "claude-sonnet-4-6": Model(
         PROVIDER_ANTHROPIC, None, ANTHROPIC_KEY_ENV,
-        thinking=_THINK_SONNET_4_6),
+        forced_tool_choice=True,
+        thinking=_THINK_SONNET_4_6,
+        sampling_bands=_ANTHROPIC_SAMPLING_BANDS),
     # Haiku 4.5. Context 200K, max output 64K — the only current Anthropic entry
     # that is not 1M/128K. Pre-4.6 generation: thinking only via
     # `budget_tokens`, and the `effort` parameter errors, so no levels are
@@ -650,7 +765,9 @@ MODEL_REGISTRY = {
     # is a repointable pointer (see the module docstring).
     "claude-haiku-4-5-20251001": Model(
         PROVIDER_ANTHROPIC, None, ANTHROPIC_KEY_ENV,
-        thinking=_THINK_BUDGET_ONLY),
+        forced_tool_choice=True,
+        thinking=_THINK_BUDGET_ONLY,
+        sampling_bands=_ANTHROPIC_SAMPLING_BANDS),
     # The three entries below are RETIRED on the Anthropic API (deprecation
     # table verified 2026-07-31): a live call fails, so they must never start a
     # new run. They are kept, flagged rather than deleted, because the registry
@@ -666,31 +783,50 @@ MODEL_REGISTRY = {
     # capability facts about a withdrawn endpoint nobody can re-verify.
     # Sonnet 4 (legacy): retired 2026-06-15, replaced by claude-sonnet-5.
     "claude-sonnet-4-20250514": Model(
-        PROVIDER_ANTHROPIC, None, ANTHROPIC_KEY_ENV, retired=True),
+        PROVIDER_ANTHROPIC, None, ANTHROPIC_KEY_ENV,
+        forced_tool_choice=True, retired=True),
     # Claude 3.5 Sonnet (legacy): retired 2025-10-28, replaced by
     # claude-sonnet-5.
     "claude-3-5-sonnet-20241022": Model(
-        PROVIDER_ANTHROPIC, None, ANTHROPIC_KEY_ENV, retired=True),
+        PROVIDER_ANTHROPIC, None, ANTHROPIC_KEY_ENV,
+        forced_tool_choice=True, retired=True),
     # Opus 4 (legacy): retired 2026-06-15, replaced by claude-opus-5.
     "claude-opus-4-20250514": Model(
-        PROVIDER_ANTHROPIC, None, ANTHROPIC_KEY_ENV, retired=True),
+        PROVIDER_ANTHROPIC, None, ANTHROPIC_KEY_ENV,
+        forced_tool_choice=True, retired=True),
 
     # ---- OpenAI (GPT) -------------------------------------------------------
+    # FORCED TOOL_CHOICE (both GPT-5.6 entries): OpenAI's function-calling
+    # reference documents forcing a named function via tool_choice, from the
+    # published-reference reads of 2026-07-31 / 2026-08-01 that populated
+    # these rows. No sampling band is declared: the range of the params these
+    # entries still accept was not re-read.
+    #
     # GPT-5.6 flagship. Reasoning model: rejects temperature, defaults to medium
     # reasoning effort.
     "gpt-5.6-sol": Model(
         PROVIDER_OPENAI, OPENAI_BASE_URL, OPENAI_KEY_ENV,
         quirks={"reasoning_effort": "medium"},
+        forced_tool_choice=True,
         rejects_sampling=_NO_TEMPERATURE,
         wire_api=WIRE_RESPONSES),
     # GPT-5.6 mid-tier. Same reasoning-model surface as the flagship.
     "gpt-5.6-terra": Model(
         PROVIDER_OPENAI, OPENAI_BASE_URL, OPENAI_KEY_ENV,
         quirks={"reasoning_effort": "medium"},
+        forced_tool_choice=True,
         rejects_sampling=_NO_TEMPERATURE,
         wire_api=WIRE_RESPONSES),
 
     # ---- Routed via OpenRouter ---------------------------------------------
+    # SAMPLING BANDS (`_OPENROUTER_SURFACE_BANDS`, the routed entries that
+    # take sampling): these describe the OpenRouter request surface itself —
+    # not any upstream's narrower taste, which no probe of a continuous range
+    # could establish. What the gateway itself would do with an out-of-range
+    # value (refuse, clamp, forward) was not probed; the band exists so a
+    # caller can refuse such a value before any spend, and an upstream
+    # rejection of an in-band value stays the loud backstop.
+    #
     # GLM / Qwen traffic routes through OpenRouter's OpenAI-compatible Chat
     # Completions surface, pinned to a named upstream and fingerprinted. The
     # registry id IS the OpenRouter model slug verbatim (id-as-identity). A
@@ -720,6 +856,7 @@ MODEL_REGISTRY = {
         # a caller arms its own bounded validate/retry loop (see the
         # TOOL-CALLING CAVEAT above).
         forced_tool_choice=False,
+        sampling_bands=_OPENROUTER_SURFACE_BANDS,
         route=Route(gateway=GATEWAY_OPENROUTER, upstream=("z-ai",),
                     quantizations=("fp8",))),
     # GLM 4.6V: served by both Z.AI (fp8) and Novita (bf16); pinned to Z.AI
@@ -731,6 +868,7 @@ MODEL_REGISTRY = {
         # Same forced-tool_choice 404 as glm-5v-turbo (both GLM vision
         # endpoints, confirmed live 2026-07-23): runs "auto" + retry.
         forced_tool_choice=False,
+        sampling_bands=_OPENROUTER_SURFACE_BANDS,
         route=Route(gateway=GATEWAY_OPENROUTER, upstream=("z-ai",),
                     quantizations=("fp8",))),
     # Qwen3-VL flagship (235B-A22B Instruct), pinned to Venice + Parasail at fp8.
@@ -761,6 +899,11 @@ MODEL_REGISTRY = {
     "qwen/qwen3-vl-235b-a22b-instruct": Model(
         PROVIDER_OPENROUTER, OPENROUTER_BASE_URL, OPENROUTER_KEY_ENV,
         wire_api=WIRE_CHAT_COMPLETIONS, supports_images=True,
+        # Forced named tool_choice returned the named call on both pinned
+        # hosts, live 2026-07-23 (point 3 above; the per-(host, model) probe
+        # discipline is spelled out there).
+        forced_tool_choice=True,
+        sampling_bands=_OPENROUTER_SURFACE_BANDS,
         route=Route(gateway=GATEWAY_OPENROUTER, upstream=("venice", "parasail"),
                     quantizations=("fp8",))),
     # Xiaomi MiMo v2.5, pinned to Parasail + Venice at fp8. Vision + prompt
@@ -797,6 +940,7 @@ MODEL_REGISTRY = {
         # Venice honours it. Runs "auto" + retry to keep the two-host pin uniform
         # (live-confirmed 2026-07-23; see the FORCED-TOOL-CHOICE note above).
         forced_tool_choice=False,
+        sampling_bands=_OPENROUTER_SURFACE_BANDS,
         route=Route(gateway=GATEWAY_OPENROUTER,
                     upstream=("parasail", "venice"),
                     quantizations=("fp8",))),
@@ -960,7 +1104,7 @@ def model_supports_images(model):
     return model_info(model).supports_images
 
 
-def supports_forced_tool_choice(model):
+def supports_forced_tool_choice(model) -> bool:
     """Whether `model`'s endpoint honours a FORCED / named tool_choice.
 
     True for every direct endpoint (Anthropic, OpenAI) and for two routed
@@ -1005,6 +1149,21 @@ def rejected_sampling_params(model):
     accessor).
     """
     return frozenset(model_info(model).rejects_sampling)
+
+
+def sampling_band(model, param):
+    """The (low, high) range `model`'s reference documents for `param`, or None.
+
+    None means no range has been established for that param on this entry —
+    the value is sent and the endpoint's own answer settles it — never that
+    every value is accepted. A declared band claims only that a value OUTSIDE
+    it can be refused before the call is billed; an in-band value the endpoint
+    dislikes still fails at the endpoint, which stays the loud backstop.
+    Raises ValueError for an unknown id, like `model_info`. Mirrors
+    `rejected_sampling_params` (the field lives on the `Model` record too, as
+    `model_info(model).sampling_bands`; this is the named accessor).
+    """
+    return model_info(model).sampling_bands.get(param)
 
 
 def thinking_support(model):

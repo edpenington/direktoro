@@ -89,13 +89,13 @@ def test_routing_names_are_public():
         assert name in direktoro.__all__, name
 
 
-# The capability predicates a consumer branches on: whether the endpoint honours
-# a forced named tool_choice (False for the two routed GLM entries and MiMo,
-# which arm an auto-degrade retry instead), and whether it accepts the sampling
-# controls (False for google/gemini-3.6-flash, whose Vertex endpoints dropped
-# them).
+# The capability lookups a consumer branches on: whether the endpoint honours
+# a forced named tool_choice (stated per entry, never defaulted; a False arms
+# the consumer's auto-degrade retry), which sampling controls it refuses, and
+# the documented value range for one it accepts.
 CAPABILITY_PREDICATES = ["supports_forced_tool_choice",
-                         "rejected_sampling_params"]
+                         "rejected_sampling_params",
+                         "sampling_band"]
 
 
 def test_capability_predicates_are_public():

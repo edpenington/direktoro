@@ -18,7 +18,7 @@ from direktoro.cost import COUNTERS, cost_from_rates, cost_from_usage
 from direktoro.providers import NormalisedUsage, resolved_decoding_params
 from direktoro.registry import (
     MODEL_REGISTRY, Model, SAMPLING_PARAMS, is_known_model, is_retired,
-    known_models, model_info)
+    known_models, model_info, sampling_band)
 
 
 class TestKnownModels:
@@ -95,9 +95,11 @@ class TestRetiredFlag:
     }
 
     def test_field_defaults_false(self):
-        # A bare Model construction carries retired False, so the flag is
-        # opt-in per entry.
-        assert Model("anthropic", None, "ANTHROPIC_API_KEY").retired is False
+        # A minimal Model construction carries retired False, so the flag is
+        # opt-in per entry. (forced_tool_choice has no default and must be
+        # stated even here.)
+        assert Model("anthropic", None, "ANTHROPIC_API_KEY",
+                     forced_tool_choice=True).retired is False
 
     def test_withdrawn_ids_are_flagged_retired(self):
         for model_id in self.RETIRED_ANTHROPIC_IDS:
@@ -122,7 +124,8 @@ class TestRetiredFlag:
         # The registry's dual role must survive the flag: a retired id is still
         # looked up for provenance, and it is only NEW runs that reject it. So
         # model_info must NOT raise on one.
-        retired = Model("anthropic", None, "ANTHROPIC_API_KEY", retired=True)
+        retired = Model("anthropic", None, "ANTHROPIC_API_KEY",
+                        forced_tool_choice=True, retired=True)
         monkeypatch.setitem(MODEL_REGISTRY, "synthetic-retired-1", retired)
 
         assert is_known_model("synthetic-retired-1")
@@ -256,6 +259,7 @@ class TestModelFieldOrder:
         "retired",
         "route",
         "thinking",
+        "sampling_bands",
     )
 
     def test_field_order_is_pinned(self):
@@ -273,7 +277,8 @@ class TestModelFieldOrder:
         # The failure the order guards against, made concrete: these three are
         # what every registry entry passes positionally, and what the adapters
         # read back to reach a model.
-        entry = Model("anthropic", "https://example.invalid/v1", "SOME_KEY_ENV")
+        entry = Model("anthropic", "https://example.invalid/v1", "SOME_KEY_ENV",
+                      forced_tool_choice=True)
         assert entry.provider == "anthropic"
         assert entry.base_url == "https://example.invalid/v1"
         assert entry.api_key_env == "SOME_KEY_ENV"
@@ -290,6 +295,135 @@ class TestModelFieldOrder:
                 f"Model.{f.name} has no default, so it is a required "
                 f"positional argument and every existing Model(...) call is "
                 f"now a TypeError. Give it a default.")
+
+
+class TestForcedToolChoiceIsStated:
+    """The flag has no working default: whether an endpoint honours a forced
+    tool_choice was either established or it was not, so every entry states it
+    and an unstated one is a construction error, not a silent claim."""
+
+    def test_unstated_flag_is_refused_at_construction(self):
+        with pytest.raises(ValueError, match="forced_tool_choice"):
+            Model("anthropic", None, "ANTHROPIC_API_KEY")
+
+    @pytest.mark.parametrize("value", ["yes", "false", 0, 1, [True]])
+    def test_a_non_bool_flag_is_refused(self, value):
+        # The record is reachable positionally, and a truthy non-bool read as
+        # True would force a named tool on an endpoint that 404s one — the
+        # paid failure the statement requirement exists to prevent.
+        with pytest.raises(ValueError, match="as a bool"):
+            Model("anthropic", None, "ANTHROPIC_API_KEY",
+                  forced_tool_choice=value)
+
+    def test_every_registry_entry_states_the_flag(self):
+        # Import already enforces this (a None would have raised); the assert
+        # documents that the table holds real booleans, not sentinels.
+        for model_id, m in MODEL_REGISTRY.items():
+            assert isinstance(m.forced_tool_choice, bool), model_id
+
+    def test_the_flag_is_the_only_field_requiring_statement(self):
+        # The append-only rule's other half used to be "every field after the
+        # third has a default that WORKS". forced_tool_choice deliberately
+        # trades that away, and this pins the trade to exactly one field: a
+        # construction stating only the three positionals plus the flag
+        # succeeds, so no other sentinel has crept in.
+        m = Model("anthropic", None, "ANTHROPIC_API_KEY",
+                  forced_tool_choice=True)
+        assert m.retired is False
+
+
+class TestSamplingBands:
+    """A band records the documented (low, high) range for one sampling param.
+    Absence is honest — nothing established — and a band can never contradict
+    `rejects_sampling`, which claims the param is refused outright."""
+
+    def test_documented_band_is_returned(self):
+        # Anthropic documents temperature 0.0-1.0; the entries that still take
+        # sampling carry it.
+        assert sampling_band("claude-sonnet-4-6", "temperature") == (0.0, 1.0)
+        assert sampling_band("claude-haiku-4-5-20251001",
+                             "temperature") == (0.0, 1.0)
+
+    def test_unestablished_band_is_none(self):
+        # No numeric range is published for Anthropic's top_p / top_k, so no
+        # band is declared — the value is sent and the endpoint answers.
+        assert sampling_band("claude-sonnet-4-6", "top_p") is None
+        assert sampling_band("claude-sonnet-4-6", "top_k") is None
+
+    def test_rejected_param_has_no_band(self):
+        # Opus 5 refuses temperature outright; a band for it would be a
+        # contradiction, so the accessor reports nothing.
+        assert sampling_band("claude-opus-5", "temperature") is None
+
+    def test_every_routed_entry_is_accounted_for(self):
+        # The band on a routed entry is OpenRouter's own documented request
+        # range, not an upstream fact a probe could establish — and gemini,
+        # which refuses temperature and top_p outright, deliberately carries
+        # none. Derived from the table so a new routed entry must take a
+        # position here.
+        for model_id, info in MODEL_REGISTRY.items():
+            if info.route is None:
+                continue
+            if model_id == "google/gemini-3.6-flash":
+                assert not info.sampling_bands, model_id
+                continue
+            assert sampling_band(model_id, "temperature") == (0.0, 2.0)
+            assert sampling_band(model_id, "top_p") == (0.0, 1.0)
+
+    def test_undeclared_bands_stay_undeclared(self):
+        # The GPT entries' comment says no band is declared because their
+        # accepted ranges were not re-read; pinned so a later hand adding one
+        # has to bring the read with it. The retired entries likewise carry
+        # none — no current reference describes them.
+        for model_id in ("gpt-5.6-sol", "gpt-5.6-terra",
+                         "claude-sonnet-4-20250514",
+                         "claude-3-5-sonnet-20241022",
+                         "claude-opus-4-20250514"):
+            assert not model_info(model_id).sampling_bands, model_id
+
+    def test_bands_are_read_only(self):
+        # A band is a recorded documented fact; handing out a mutable mapping
+        # would let one reader edit every later reader's copy of the record.
+        bands = model_info("claude-sonnet-4-6").sampling_bands
+        with pytest.raises(TypeError):
+            bands["temperature"] = (0.0, 99.0)
+
+    @pytest.mark.parametrize("bad", [None, {"temperature"},
+                                     [("temperature", (0.0, 1.0))]])
+    def test_a_non_mapping_container_is_refused(self, bad):
+        with pytest.raises(TypeError, match="must be a dict"):
+            Model("anthropic", None, "K", forced_tool_choice=True,
+                  sampling_bands=bad)
+
+    def test_unknown_model_raises(self):
+        with pytest.raises(ValueError, match="unknown model"):
+            sampling_band("totally-made-up-model-9000", "temperature")
+
+    def test_unknown_param_name_refused_at_construction(self):
+        with pytest.raises(ValueError, match="not a sampling"):
+            Model("anthropic", None, "K", forced_tool_choice=True,
+                  sampling_bands={"presence_penalty": (0.0, 1.0)})
+
+    def test_band_contradicting_a_refusal_is_refused(self):
+        with pytest.raises(ValueError, match="rejects_sampling"):
+            Model("anthropic", None, "K", forced_tool_choice=True,
+                  rejects_sampling=frozenset({"temperature"}),
+                  sampling_bands={"temperature": (0.0, 1.0)})
+
+    @pytest.mark.parametrize("band", [
+        (1.0,),                       # not a pair
+        [0.0, 1.0],                   # not a tuple
+        (1.0, 0.0),                   # reversed
+        ("0.0", "1.0"),               # not numbers
+        (False, True),                # booleans are not band values
+        (float("nan"), 1.0),          # NaN satisfies low <= high vacuously
+        (float("nan"), float("nan")),
+        (float("-inf"), float("inf")),  # declares a fact, claims nothing
+    ])
+    def test_malformed_band_is_refused(self, band):
+        with pytest.raises(ValueError, match="low, high"):
+            Model("anthropic", None, "K", forced_tool_choice=True,
+                  sampling_bands={"temperature": band})
 
 
 class TestModelInfoErrors:
