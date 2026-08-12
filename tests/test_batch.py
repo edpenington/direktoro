@@ -351,11 +351,16 @@ def test_a_batch_response_matches_a_live_one_field_for_field():
         sleep=lambda *_: None, poll_interval=0)["a"]
 
     for field in ("provider", "base_url", "stop_reason", "resolved_model",
-                  "wire_request", "decoding_params", "generation_id",
+                  "raw_request", "raw_response", "wire_request",
+                  "decoding_params", "generation_id",
                   "served_provider", "reported_cost"):
         assert getattr(batched, field) == getattr(live, field), field
     assert batched.usage == live.usage
     assert batched.content == live.content
+    # The audit equality, stated by both paths' docstrings: the request rides
+    # under both names.
+    assert batched.wire_request is batched.raw_request
+    assert live.wire_request is live.raw_request
 
 
 def test_decoding_params_reach_the_response_from_the_submitted_request():

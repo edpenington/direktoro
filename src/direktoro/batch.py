@@ -49,6 +49,7 @@ import time as _time
 
 from direktoro.providers import MissingAPIKey, NormalisedResponse, NormalisedUsage
 from direktoro.registry import PROVIDER_ANTHROPIC
+from direktoro.wire_log import response_to_dict
 
 # Default gap between batch-status polls, in seconds. Batches usually finish
 # well within an hour; a leisurely poll keeps the request count low. Tests inject
@@ -118,15 +119,21 @@ def normalise_batch_message(message, *, raw_request=None, decoding_params=None):
     Three fields are worth naming, because "field-for-field" is a promise and
     not all three come from the message:
 
-    * ``base_url`` and ``wire_request`` are ``None`` because that is what a LIVE
-      Anthropic call records too — every Anthropic registry entry pins no base
-      URL, and the canonical request IS the Anthropic wire request, so there is
-      no second one to store. These are equalities, not placeholders.
+    * ``base_url`` is ``None`` because that is what a LIVE Anthropic call
+      records too — every Anthropic registry entry pins no base URL. An
+      equality, not a placeholder.
     * ``raw_request`` and ``decoding_params`` describe the request rather than
       the response, so they can only come from the caller that submitted it.
       :func:`run_message_batch` threads ``decoding_params`` through from the
       submitted params; a caller mapping raw results by hand supplies whichever
-      it holds, and what it omits stays ``None`` / ``{}``.
+      it holds, and what it omits stays ``None`` / ``{}``. ``wire_request``
+      mirrors the live path's equality — the canonical request IS the
+      Anthropic wire — so the supplied ``raw_request`` rides under both names,
+      and an audit path reads ``wire_request`` on a batch response exactly as
+      it does on a live one. Both names ALIAS the caller's own params dict
+      rather than snapshotting it: a caller that mutates a shared params
+      template between submissions rewrites what its earlier records say was
+      sent. Write the audit entry before reusing the dict, or pass a copy.
 
     ``decoding_params`` matters beyond the audit trail: a consumer folding it
     into :func:`direktoro.routing.call_identity_fields` — which that function
@@ -166,10 +173,10 @@ def normalise_batch_message(message, *, raw_request=None, decoding_params=None):
         # adapter records None here too.
         base_url=None,
         raw_request=raw_request,
-        raw_response=message,
-        # Same equality: the canonical request is the Anthropic wire request, so
-        # the live adapter has no separate wire request to record either.
-        wire_request=None,
+        raw_response=response_to_dict(message),
+        # Same equality as the live adapter: the canonical request is the
+        # Anthropic wire request, so it rides under both names.
+        wire_request=raw_request,
         decoding_params=decoding_params if decoding_params is not None else {},
     )
 
@@ -262,7 +269,8 @@ def fetch_batch_results(client, batch_id):
     return list(client.messages.batches.results(batch_id))
 
 
-def map_batch_results(raw_results, *, expected_ids=None, decoding_params=None):
+def map_batch_results(raw_results, *, expected_ids=None, decoding_params=None,
+                      raw_requests=None):
     """Map raw per-request results to ``{custom_id: NormalisedResponse}``.
 
     Each succeeded result is normalised (see :func:`normalise_batch_message`) and
@@ -283,11 +291,14 @@ def map_batch_results(raw_results, *, expected_ids=None, decoding_params=None):
     ``decoding_params`` is an optional ``{custom_id: dict}`` mapping of the
     decoding block each request was submitted with, threaded onto that request's
     response so a batch-served call and the identical live call carry the same
-    call identity (see :func:`normalise_batch_message`).
-    :func:`run_message_batch` builds it from the submitted requests; an id with
-    no entry gets an empty block.
+    call identity (see :func:`normalise_batch_message`). ``raw_requests`` is
+    the same shape for the submitted request itself, threaded through as
+    ``raw_request`` / ``wire_request`` so the audit fields match the live
+    path's too. :func:`run_message_batch` builds both from the submitted
+    requests; an id with no entry gets an empty block / ``None``.
     """
     decoding_by_id = decoding_params or {}
+    requests_by_id = raw_requests or {}
     responses: dict = {}
     errors: dict = {}
     seen: dict = {}
@@ -298,6 +309,7 @@ def map_batch_results(raw_results, *, expected_ids=None, decoding_params=None):
         if _get(result, "type") == _SUCCEEDED:
             responses[custom_id] = normalise_batch_message(
                 _get(result, "message"),
+                raw_request=requests_by_id.get(custom_id),
                 decoding_params=decoding_by_id.get(custom_id))
         else:
             errors[custom_id] = _result_error_reason(result)
@@ -345,12 +357,15 @@ def run_message_batch(client, requests, *, sleep=None, poll_interval=None,
     decoding_params = {_get(r, "custom_id"):
                        _submitted_decoding_params(_get(r, "params"))
                        for r in requests}
+    raw_requests = {_get(r, "custom_id"): _get(r, "params")
+                    for r in requests}
     batch_id = submit_batch(client, requests)
     poll_batch(client, batch_id, sleep=sleep, poll_interval=poll_interval,
                max_polls=max_polls)
     raw_results = fetch_batch_results(client, batch_id)
     return map_batch_results(raw_results, expected_ids=expected_ids,
-                             decoding_params=decoding_params)
+                             decoding_params=decoding_params,
+                             raw_requests=raw_requests)
 
 
 # ---------------------------------------------------------------------------

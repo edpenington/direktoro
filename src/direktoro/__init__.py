@@ -90,6 +90,12 @@ from direktoro.batch import (
     normalise_batch_message,
     run_message_batch,
 )
+from direktoro.wire_log import (
+    redact_messages,
+    redact_system,
+    redact_wire_request,
+    response_to_dict,
+)
 
 # The single source of truth for the package version: `pyproject.toml` declares
 # `dynamic = ["version"]` and reads this attribute at build time
@@ -98,7 +104,7 @@ from direktoro.batch import (
 # here and nowhere else: this version can end up inside a caller's own
 # call-identity fingerprint, so a bump moves published provenance and must be
 # deliberate. `tests/test_public_api.py` asserts the wiring.
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "__version__",
@@ -109,6 +115,14 @@ __all__ = [
     # Forced-named-tool helpers
     "tool_choice_named",
     "extract_tool_call",
+    # Audit-log helpers (direktoro.wire_log): stub inline image bytes out of
+    # a request before logging it, and flatten a provider SDK response object
+    # to a plain dict. Here because which block shapes carry image bytes on
+    # which wire is this package's knowledge, not a consumer's.
+    "redact_messages",
+    "redact_system",
+    "redact_wire_request",
+    "response_to_dict",
     # Decoding params (single source of truth), and the splitter that takes
     # one role's decoding block from an application config — sampling controls
     # and thinking_* fields side by side — and returns the (sampling,

@@ -182,14 +182,22 @@ which table priced it.
 
 ## What is in it
 
-- **Provider adapters** — `AnthropicAdapter` and `OpenAIAdapter`. The canonical
-  request is Anthropic-shaped (system as text blocks, messages as content-block
-  lists, tools with an `input_schema`); adapters translate outward. The OpenAI
-  adapter covers two wire protocols, the Responses API and the
-  OpenAI-compatible Chat Completions surface, chosen per model by the registry.
-  `create_message` makes exactly one call and raises a normalised
-  `ProviderError` (or a retryable subclass) on failure;
+- **Provider adapters** — `AnthropicAdapter` and `OpenAIAdapter`. Callers
+  speak this package's canonical format (system as a string or text blocks,
+  messages as content-block lists, tools with an `input_schema` — a block
+  vocabulary that deliberately coincides with the Anthropic wire); adapters
+  translate outward. The OpenAI adapter covers two wire protocols, the
+  Responses API and the OpenAI-compatible Chat Completions surface, chosen
+  per model by the registry. `create_message` makes exactly one call and
+  raises a normalised `ProviderError` (or a retryable subclass) on failure;
   `create_message_with_retry` is the backoff loop for callers who want one.
+
+- **Audit-log helpers** — `direktoro.wire_log`: `redact_wire_request` (and
+  `redact_messages` / `redact_system`) stub inline base64 image bytes into
+  `image_ref` records across every wire image shape this package speaks, and
+  `response_to_dict` flattens a provider SDK response object. Every adapter
+  response carries the `wire_request` actually sent and a plain-dict
+  `raw_response`, so a consumer's audit log is redact-and-write.
 
 - **Model registry** — 16 entries: eleven direct (Anthropic and OpenAI) and
   five routed through OpenRouter. Each records provider, base URL, key

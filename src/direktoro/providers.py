@@ -1,18 +1,35 @@
 """Provider adapters: one thin translation layer per LLM provider.
 
-Callers speak a single canonical request/response shape, and that shape is the
-Anthropic one: system as a list of text blocks, messages as content-block lists
-(`text` / `image` / `tool_use` / `tool_result`), tools with an `input_schema`,
-and decoding params named `max_tokens` plus whatever sampling controls the
-caller specified. Nothing above the
-adapter sees a provider wire format, which is what lets a caller store, resume,
-replay or render a conversation in one shape regardless of who served it.
+Callers speak THIS PACKAGE'S canonical request/response format, and the
+adapters translate it to and from each provider's wire. The canonical format
+is direktoro's contract with its consumers: system as a string or a list of
+text blocks, messages as content-block lists (`text` / `image` / `tool_use` /
+`tool_result`), tool definitions as `{name, description, input_schema}`, and
+decoding params named `max_tokens` plus whatever sampling controls the caller
+specified. Its block vocabulary coincides byte-for-byte with the Anthropic
+wire — a deliberate choice that makes one adapter's translation the identity —
+but the contract is this package's: nothing above the adapter sees a provider
+wire format, which is what lets a caller store, resume, replay or render a
+conversation in one shape regardless of who served it.
 
-An adapter translates that canonical request to its provider's wire format,
+One rule about tool-call OUTPUT that no wire enforces uniformly, stated here
+because a consumer cannot discover it from the request format: a BOOLEAN
+FIELD IN A TOOL CALL'S INPUT MUST NOT ARRIVE NULL. The Anthropic wire
+rejects a null boolean server-side; the OpenAI-family tools this package
+emits do not (the Responses translation sets `strict: False`, and the Chat
+Completions tool shape carries no strict field at all), so a null boolean
+passes those wires silently. A consumer validating tool-call output
+therefore enforces the rule itself rather than relying on the wire to catch
+it.
+
+An adapter translates the canonical request to its provider's wire format,
 makes the call, and translates the response back into a `NormalisedResponse`
-whose `.content` is a list of Anthropic-shaped block objects and whose `.usage`
+whose `.content` is a list of canonical block objects and whose `.usage`
 is normalised token counts. One piece of calling code therefore reads every
-provider's response.
+provider's response, and every ADAPTER response carries the `wire_request`
+that was actually sent — the batch mapper threads it through when handed
+the submitted requests — ready for `direktoro.wire_log.redact_wire_request`
+and the caller's audit log.
 
 Adapters do not retry: `create_message` makes one call and, on a provider API
 error, raises a normalised `ProviderError` (or a retryable subclass). A caller
@@ -33,6 +50,7 @@ from direktoro.registry import (
     THINKING_DISABLED, THINKING_DISPLAYS, THINKING_MODES,
     WIRE_CHAT_COMPLETIONS, WIRE_RESPONSES, model_info)
 from direktoro.routing import assert_served_upstream, provider_object
+from direktoro.wire_log import response_to_dict
 
 
 # ---------------------------------------------------------------------------
@@ -171,12 +189,15 @@ class NormalisedResponse:
     the blocks — pulling out tool calls, or reading the first block's text —
     works unchanged across providers.
 
-    `raw_request` is the canonical (Anthropic-shaped) request, for the caller's
-    audit log. `wire_request` is the provider's actual wire request (None for
-    Anthropic, where the two are the same). `decoding_params` records the
-    decoding parameters actually sent after quirks were applied (for example
-    sampling controls omitted for models that refuse them), so a stored record of the
-    call is self-contained.
+    `raw_request` is the canonical request, for the caller's audit log.
+    `wire_request` is the provider's actual wire request as sent — on the
+    Anthropic path the two are byte-identical (the canonical format IS that
+    wire), and it is recorded under both names so an audit path reads ONE
+    field whoever served the call. `raw_response` is the provider's response
+    as a plain dict (`wire_log.response_to_dict`), never an SDK object.
+    `decoding_params` records the decoding parameters actually sent after
+    quirks were applied (for example sampling controls omitted for models
+    that refuse them), so a stored record of the call is self-contained.
 
     The routing fields are populated only for gateway-served (OpenRouter)
     responses and stay None for direct calls, which have no gateway equivalent:
@@ -1008,10 +1029,11 @@ class AnthropicAdapter:
             provider=self.provider,
             base_url=self.base_url,
             raw_request=wire,
-            raw_response=response,
-            # The Anthropic wire request IS the canonical request, so there is
-            # no separate wire request to record in the audit log.
-            wire_request=None,
+            # The canonical request IS this wire, so the same dict rides under
+            # both names and an audit path reads `wire_request` whoever served
+            # the call.
+            raw_response=response_to_dict(response),
+            wire_request=wire,
             decoding_params=decoding,
         )
 
@@ -1140,8 +1162,10 @@ class OpenAIAdapter:
                 response = self._client.chat.completions.create(**wire)
             except Exception as exc:
                 raise _translate_openai_error(exc)
-            raw = (response.model_dump()
-                   if hasattr(response, "model_dump") else response)
+            # One converter for every path (`wire_log.response_to_dict`), so
+            # raw_response is a plain dict on this adapter exactly as on the
+            # Anthropic one, whatever object the client returned.
+            raw = response_to_dict(response)
             normalised = self._from_chat_wire(raw, canonical=canonical,
                                               wire=wire, decoding=decoding)
             if route is not None:
@@ -1158,8 +1182,7 @@ class OpenAIAdapter:
         except Exception as exc:
             raise _translate_openai_error(exc)
 
-        raw = (response.model_dump()
-               if hasattr(response, "model_dump") else response)
+        raw = response_to_dict(response)
         return self._from_wire(raw, canonical=canonical, wire=wire,
                                decoding=decoding)
 

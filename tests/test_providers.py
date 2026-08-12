@@ -629,8 +629,9 @@ class TestAnthropicAdapter:
         assert resp.usage.input_tokens == 10
         assert resp.usage.cache_read_input_tokens == 3
         assert resp.usage.cache_creation_input_tokens == 1
-        # No separate wire request: it equals the canonical request.
-        assert resp.wire_request is None
+        # The canonical request IS the Anthropic wire, recorded under both
+        # names so an audit path reads wire_request whoever served the call.
+        assert resp.wire_request is resp.raw_request
 
     def test_sonnet_sends_temperature(self):
         sink = {}
@@ -1207,5 +1208,7 @@ class TestAnthropicStreamIsDrained:
             messages=[{"role": "user", "content": "hi"}], max_tokens=4096)
 
         assert stream.consumed == ["par", "tial", " text"]
-        assert resp.raw_response is response
+        # raw_response is a plain dict (wire_log.response_to_dict), never the
+        # SDK object, so an audit log can serialise it without SDK knowledge.
+        assert resp.raw_response["content"] == [{"type": "text", "text": "hi"}]
         assert resp.content[0].text == "hi"

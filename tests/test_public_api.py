@@ -98,6 +98,24 @@ CAPABILITY_PREDICATES = ["supports_forced_tool_choice",
                          "rejected_sampling_params",
                          "sampling_band"]
 
+# The audit-log helpers (direktoro.wire_log): which block shapes carry inline
+# image bytes on which wire is this package's knowledge, so the redactors and
+# the SDK-object flattener are public here rather than re-derived downstream.
+WIRE_LOG_NAMES = [
+    "redact_messages",
+    "redact_system",
+    "redact_wire_request",
+    "response_to_dict",
+]
+
+
+def test_wire_log_names_are_public():
+    import direktoro
+
+    for name in WIRE_LOG_NAMES:
+        assert hasattr(direktoro, name), name
+        assert name in direktoro.__all__, name
+
 
 def test_capability_predicates_are_public():
     import direktoro
