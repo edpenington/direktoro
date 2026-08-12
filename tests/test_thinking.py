@@ -285,15 +285,15 @@ class TestRefusesShapesTheModelWouldReject:
                 thinking=Thinking(mode=THINKING_ADAPTIVE,
                                   display="summarized"))
 
-    @pytest.mark.parametrize("model", [GPT, GLM])
-    def test_non_anthropic_models_refuse_the_spec(self, model):
-        # The seam emits Anthropic wire keys. Reasoning effort for the OpenAI
-        # families rides the registry's `reasoning_effort` quirk, and no routed
-        # entry has had its accepted levels live-verified, so refusing is the
-        # honest answer rather than translating on a guess.
-        with pytest.raises(ThinkingUnsupported):
+    def test_an_undeclared_openai_entry_still_refuses_the_spec(self):
+        # The GPT entries declare no thinking surface (their accepted levels
+        # have not been read from a current reference), so a spec aimed at one
+        # is refused with the fact rather than rendered on a guess; the
+        # registry `reasoning_effort` quirk keeps carrying their omitted-state
+        # default.
+        with pytest.raises(ThinkingUnsupported, match="declares no thinking"):
             resolved_decoding_params(
-                model, max_tokens=8192,
+                GPT, max_tokens=8192,
                 thinking=Thinking(mode=THINKING_ADAPTIVE))
 
     def test_undeclared_thinking_support_refuses_rather_than_guesses(self):
@@ -324,6 +324,342 @@ class TestRefusesShapesTheModelWouldReject:
             thinking=Thinking(mode=THINKING_DISABLED))
         assert disabled == plain
         assert thinking_support(HAIKU_4_5).default_on is False
+
+
+class TestOpenAIFamilyRendering:
+    """A thinking spec renders onto the OpenAI-family wires as one reasoning
+    level: a named effort as itself, a disabled mode as "none" (the probed
+    off-switch), and adaptive-alone as nothing at all — the omitted-state
+    behaviour of a default-on endpoint, with no invented value in identity."""
+
+    GLM_46V = "z-ai/glm-4.6v"
+    QWEN = "qwen/qwen3-vl-235b-a22b-instruct"
+    GEMINI = "google/gemini-3.6-flash"
+
+    def test_a_named_effort_rides_the_chat_wire(self):
+        dec = resolved_decoding_params(
+            self.GLM_46V, max_tokens=8192,
+            thinking=Thinking(mode=THINKING_ADAPTIVE, effort="high"))
+        assert dec == {"max_tokens": 8192, "reasoning_effort": "high"}
+
+    def test_adaptive_alone_emits_nothing(self):
+        # Reasoning on a default-on endpoint IS the omitted-state behaviour;
+        # emitting a level for it would fold a value nobody chose into
+        # identity.
+        plain = resolved_decoding_params(self.GLM_46V, max_tokens=8192)
+        adaptive = resolved_decoding_params(
+            self.GLM_46V, max_tokens=8192,
+            thinking=Thinking(mode=THINKING_ADAPTIVE))
+        assert adaptive == plain == {"max_tokens": 8192}
+
+    def test_disabled_rides_as_none(self):
+        dec = resolved_decoding_params(
+            self.GLM_46V, max_tokens=512,
+            thinking=Thinking(mode=THINKING_DISABLED))
+        assert dec == {"max_tokens": 512, "reasoning_effort": "none"}
+
+    def test_disabled_with_an_effort_is_refused(self):
+        # One wire key cannot carry two levels.
+        with pytest.raises(ThinkingUnsupported, match="ONE reasoning level"):
+            resolved_decoding_params(
+                self.GLM_46V, max_tokens=8192,
+                thinking=Thinking(mode=THINKING_DISABLED, effort="low"))
+
+    def test_budget_and_display_have_no_rendering(self):
+        with pytest.raises(ThinkingUnsupported, match="budget_tokens"):
+            resolved_decoding_params(
+                self.GLM_46V, max_tokens=8192,
+                thinking=Thinking(mode=THINKING_BUDGET, budget_tokens=2048))
+        with pytest.raises(ThinkingUnsupported, match="display"):
+            resolved_decoding_params(
+                self.GLM_46V, max_tokens=8192,
+                thinking=Thinking(mode=THINKING_ADAPTIVE,
+                                  display="summarized"))
+
+    def test_an_endpoint_with_no_reasoning_parameter_refuses_a_level(self):
+        # Qwen's EMPTY efforts tuple is a probed fact (every level 404s under
+        # require_parameters), so naming one is refused with that fact.
+        with pytest.raises(ThinkingUnsupported,
+                           match="no reasoning-effort parameter"):
+            resolved_decoding_params(
+                self.QWEN, max_tokens=4096,
+                thinking=Thinking(effort="high"))
+
+    def test_disable_on_a_non_reasoning_endpoint_is_satisfied_by_omission(
+            self):
+        # Qwen does not reason unless asked (it cannot be asked), so
+        # "disabled" is already true of the plain call.
+        plain = resolved_decoding_params(self.QWEN, max_tokens=4096)
+        disabled = resolved_decoding_params(
+            self.QWEN, max_tokens=4096,
+            thinking=Thinking(mode=THINKING_DISABLED))
+        assert disabled == plain
+
+    def test_mandatory_reasoning_cannot_be_disabled(self):
+        # Gemini's probe answered 400 "Reasoning is mandatory for this
+        # endpoint"; the registry says so and the seam refuses before spend.
+        with pytest.raises(ThinkingUnsupported, match="reasons by default"):
+            resolved_decoding_params(
+                self.GEMINI, max_tokens=4096,
+                thinking=Thinking(mode=THINKING_DISABLED))
+
+    def test_a_caller_level_replaces_the_registry_default(self):
+        # The GPT quirk is the omitted-state default: sent when the caller
+        # says nothing. (A caller cannot yet name a level for GPT — its
+        # surface is undeclared — so the replacement is asserted on identity
+        # shape via the chat wire instead.)
+        spec_less = resolved_decoding_params("gpt-5.6-sol", max_tokens=4096)
+        assert spec_less["reasoning"] == {"effort": "medium"}
+        chosen = resolved_decoding_params(
+            self.GLM_46V, max_tokens=8192,
+            thinking=Thinking(mode=THINKING_ADAPTIVE, effort="low"))
+        assert chosen["reasoning_effort"] == "low"
+
+    def test_effort_reaches_call_identity_on_the_chat_wire(self):
+        low = canonical_json(call_identity_fields(
+            self.GLM_46V, decoding_params=resolved_decoding_params(
+                self.GLM_46V, max_tokens=8192,
+                thinking=Thinking(effort="low"))))
+        high = canonical_json(call_identity_fields(
+            self.GLM_46V, decoding_params=resolved_decoding_params(
+                self.GLM_46V, max_tokens=8192,
+                thinking=Thinking(effort="high"))))
+        assert low != high
+
+    def test_a_caller_level_replaces_the_quirk_on_one_entry(self, monkeypatch):
+        # The headline claim of the REGISTRY-DEFAULTED split, exercised on a
+        # single synthetic entry carrying BOTH a quirk and a declared surface
+        # (no live entry has both yet): the caller's level rides the wire and
+        # the quirk's does not.
+        from direktoro.registry import MODEL_REGISTRY, Model, ThinkingSupport
+        monkeypatch.setitem(
+            MODEL_REGISTRY, "synthetic-quirk-and-surface",
+            Model("openrouter", "https://openrouter.ai/api/v1",
+                  "OPENROUTER_API_KEY", wire_api="chat_completions",
+                  quirks={"reasoning_effort": "medium"},
+                  forced_tool_choice=True,
+                  thinking=ThinkingSupport(
+                      modes=(THINKING_ADAPTIVE,),
+                      efforts=("low", "medium", "high"), default_on=False)))
+        spec_less = resolved_decoding_params(
+            "synthetic-quirk-and-surface", max_tokens=4096)
+        assert spec_less["reasoning_effort"] == "medium"
+        chosen = resolved_decoding_params(
+            "synthetic-quirk-and-surface", max_tokens=4096,
+            thinking=Thinking(effort="low"))
+        assert chosen["reasoning_effort"] == "low"
+
+    def test_disable_is_refused_when_a_quirk_would_run_anyway(
+            self, monkeypatch):
+        # On an entry with a registry-default level, no off-switch and no
+        # default-on reasoning, a disabled request cannot be honoured by
+        # omission — the quirk would run regardless — so it is refused
+        # rather than silently overridden.
+        from direktoro.registry import MODEL_REGISTRY, Model, ThinkingSupport
+        monkeypatch.setitem(
+            MODEL_REGISTRY, "synthetic-quirk-no-off",
+            Model("openrouter", "https://openrouter.ai/api/v1",
+                  "OPENROUTER_API_KEY", wire_api="chat_completions",
+                  quirks={"reasoning_effort": "medium"},
+                  forced_tool_choice=True,
+                  thinking=ThinkingSupport(
+                      modes=(THINKING_ADAPTIVE,),
+                      efforts=("low", "medium", "high"), default_on=False)))
+        with pytest.raises(ThinkingUnsupported,
+                           match="registry-default reasoning"):
+            resolved_decoding_params(
+                "synthetic-quirk-no-off", max_tokens=4096,
+                thinking=Thinking(mode=THINKING_DISABLED))
+        # And the contradictory two-part spec is refused as a wire property,
+        # not silently dropped, even though this entry declares no disabled
+        # mode.
+        with pytest.raises(ThinkingUnsupported, match="ONE reasoning level"):
+            resolved_decoding_params(
+                "synthetic-quirk-no-off", max_tokens=4096,
+                thinking=Thinking(mode=THINKING_DISABLED, effort="low"))
+
+    def test_a_caller_level_re_spells_for_the_responses_wire(
+            self, monkeypatch):
+        # No live Responses-wire entry declares a surface yet; the branch is
+        # pinned on a synthetic one so it cannot rot unexercised.
+        from direktoro.registry import MODEL_REGISTRY, Model, ThinkingSupport
+        monkeypatch.setitem(
+            MODEL_REGISTRY, "synthetic-responses-surface",
+            Model("openai", "https://api.openai.com/v1", "OPENAI_API_KEY",
+                  wire_api="responses", forced_tool_choice=True,
+                  thinking=ThinkingSupport(
+                      modes=(THINKING_ADAPTIVE,),
+                      efforts=("low", "medium", "high"), default_on=False)))
+        dec = resolved_decoding_params(
+            "synthetic-responses-surface", max_tokens=4096,
+            thinking=Thinking(effort="high"))
+        assert dec["reasoning"] == {"effort": "high"}
+        assert "reasoning_effort" not in dec
+
+
+class TestSplitDecodingConfig:
+    """One role's decoding block from an application config splits into the
+    (sampling, thinking) pair the resolver takes, without the application
+    knowing which key is which."""
+
+    def test_a_mixed_block_splits(self):
+        from direktoro import split_decoding_config
+        sampling, thinking = split_decoding_config(
+            {"temperature": 0.0, "top_p": 0.9,
+             "thinking_mode": "adaptive", "thinking_effort": "high"})
+        assert sampling == {"temperature": 0.0, "top_p": 0.9}
+        assert thinking == Thinking(mode=THINKING_ADAPTIVE, effort="high")
+
+    def test_sampling_only_and_thinking_only(self):
+        from direktoro import split_decoding_config
+        assert split_decoding_config({"temperature": 1.0}) == \
+            ({"temperature": 1.0}, None)
+        sampling, thinking = split_decoding_config(
+            {"thinking_effort": "low"})
+        assert sampling is None
+        assert thinking == Thinking(effort="low")
+
+    def test_absent_and_empty_blocks_are_nothing(self):
+        from direktoro import split_decoding_config
+        assert split_decoding_config(None) == (None, None)
+        assert split_decoding_config({}) == (None, None)
+
+    def test_a_null_value_reads_as_unspecified(self):
+        # A config may carry a fixed key set and leave values empty; the
+        # resolver's own convention, honoured here so the two agree —
+        # sampling and thinking keys ALIKE, so a null temperature is never
+        # reported to an operator as a value that was specified and inert.
+        from direktoro import split_decoding_config
+        sampling, thinking = split_decoding_config(
+            {"temperature": 0.0, "thinking_mode": None})
+        assert sampling == {"temperature": 0.0}
+        assert thinking is None
+        assert split_decoding_config(
+            {"temperature": None, "top_p": None,
+             "thinking_mode": None}) == (None, None)
+
+    def test_integer_spellings_of_float_controls_are_normalised(self):
+        # YAML spells one intent two ways (`0` and `0.0`) and the resolved
+        # value folds into call identity byte-for-byte, so the float
+        # controls normalise; two configs meaning the same call fingerprint
+        # together. top_k is integral and is left alone.
+        from direktoro import split_decoding_config
+        a, _ = split_decoding_config({"temperature": 0, "top_p": 1})
+        b, _ = split_decoding_config({"temperature": 0.0, "top_p": 1.0})
+        assert a == b == {"temperature": 0.0, "top_p": 1.0}
+        assert all(isinstance(v, float) for v in a.values())
+        c, _ = split_decoding_config({"top_k": 5})
+        assert c == {"top_k": 5} and isinstance(c["top_k"], int)
+
+    def test_a_non_string_key_still_gets_the_naming_error(self):
+        # Raw YAML can produce non-string keys; they must land in THIS error,
+        # named, not in a TypeError from sorting mixed types.
+        from direktoro import split_decoding_config
+        with pytest.raises(ValueError, match="unknown decoding key"):
+            split_decoding_config({1: 0.5, "temprature": 0.2})
+
+    def test_an_unknown_key_fails_at_config_load(self):
+        from direktoro import split_decoding_config
+        with pytest.raises(ValueError, match="unknown decoding key"):
+            split_decoding_config({"temprature": 0.0})
+        with pytest.raises(ValueError, match="must be a mapping"):
+            split_decoding_config(0.7)
+
+    def test_a_bad_thinking_value_fails_with_the_spec_error(self):
+        # Value validation is the Thinking constructor's, not a second
+        # opinion here.
+        from direktoro import split_decoding_config
+        with pytest.raises(ValueError, match="not a known level"):
+            split_decoding_config({"thinking_effort": "extreme"})
+
+    def test_the_split_feeds_the_resolver_end_to_end(self):
+        from direktoro import split_decoding_config
+        sampling, thinking = split_decoding_config(
+            {"thinking_effort": "high"})
+        dec = resolved_decoding_params(
+            "z-ai/glm-4.6v", max_tokens=8192,
+            sampling=sampling, thinking=thinking)
+        assert dec == {"max_tokens": 8192, "reasoning_effort": "high"}
+
+
+class TestStarvingCapRefused:
+    """A reasoning call under a cap below direktoro's own policy floor is
+    refused before spend — the endpoint would accept it and burn the whole
+    cap on reasoning. The floor is this package's number, not a vendor's,
+    and the refusal says so."""
+
+    def test_the_floor_is_named_as_policy_not_endpoint_fact(self):
+        with pytest.raises(ThinkingUnsupported,
+                           match="direktoro's own floor, not the endpoint's"):
+            resolved_decoding_params(OPUS_5, max_tokens=1024)
+
+    def test_an_explicit_budget_is_exempt(self):
+        # The caller stated its own arithmetic: budget < max_tokens is
+        # enforced where the budget is validated, and the policy floor does
+        # not second-guess a stated pairing the API accepts.
+        dec = resolved_decoding_params(
+            HAIKU_4_5, max_tokens=2000,
+            thinking=Thinking(mode=THINKING_BUDGET, budget_tokens=1024))
+        assert dec["thinking"] == {"type": "enabled", "budget_tokens": 1024}
+        assert dec["max_tokens"] == 2000
+
+    def test_a_named_effort_arms_the_guard_on_the_openai_wires(self):
+        # On these wires the effort key IS the reasoning switch, so naming a
+        # level under a starving cap is refused even though the entry's
+        # default_on already covers the spec-less case.
+        with pytest.raises(ThinkingUnsupported,
+                           match="names a reasoning effort"):
+            resolved_decoding_params(
+                "z-ai/glm-4.6v", max_tokens=1024,
+                thinking=Thinking(effort="high"))
+
+    def test_the_refusal_names_the_actual_cause(self):
+        # A spec-less call on a default-on model is refused FOR the default,
+        # and the message says so rather than blaming a spec nobody passed.
+        with pytest.raises(ThinkingUnsupported, match="on by default"):
+            resolved_decoding_params(OPUS_5, max_tokens=1024)
+        with pytest.raises(ThinkingUnsupported, match="asks for 'adaptive'"):
+            resolved_decoding_params(
+                OPUS_4_8, max_tokens=1024,
+                thinking=Thinking(mode=THINKING_ADAPTIVE))
+
+    def test_default_on_model_with_a_small_cap_is_refused(self):
+        with pytest.raises(ThinkingUnsupported, match="cannot fit"):
+            resolved_decoding_params(OPUS_5, max_tokens=1024)
+
+    def test_disabling_thinking_lifts_the_refusal(self):
+        dec = resolved_decoding_params(
+            OPUS_5, max_tokens=1024,
+            thinking=Thinking(mode=THINKING_DISABLED))
+        assert dec["max_tokens"] == 1024
+
+    def test_a_default_off_model_passes_with_a_small_cap(self):
+        dec = resolved_decoding_params(OPUS_4_8, max_tokens=1024)
+        assert dec == {"max_tokens": 1024}
+
+    def test_explicitly_enabling_thinking_arms_the_guard(self):
+        with pytest.raises(ThinkingUnsupported, match="cannot fit"):
+            resolved_decoding_params(
+                OPUS_4_8, max_tokens=1024,
+                thinking=Thinking(mode=THINKING_ADAPTIVE))
+
+    def test_the_guard_covers_default_on_routed_entries(self):
+        with pytest.raises(ThinkingUnsupported, match="cannot fit"):
+            resolved_decoding_params("z-ai/glm-4.6v", max_tokens=1024)
+        dec = resolved_decoding_params(
+            "z-ai/glm-4.6v", max_tokens=1024,
+            thinking=Thinking(mode=THINKING_DISABLED))
+        assert dec == {"max_tokens": 1024, "reasoning_effort": "none"}
+
+    def test_an_undeclared_surface_is_not_guarded(self):
+        # Nothing established, nothing to guard: the GPT entries carry no
+        # ThinkingSupport, so a small cap passes through to the endpoint.
+        dec = resolved_decoding_params("gpt-5.6-sol", max_tokens=64)
+        assert dec["max_output_tokens"] == 64
+
+    def test_no_cap_no_guard(self):
+        dec = resolved_decoding_params(OPUS_5, max_tokens=None)
+        assert dec["max_tokens"] is None
 
 
 class TestSamplingParamsAndThinking:
@@ -538,9 +874,22 @@ class TestThinkingSupportValidation:
         with pytest.raises(ValueError, match="unknown effort"):
             ThinkingSupport(efforts=("ultra",), default_effort="ultra")
 
-    def test_efforts_require_a_default_effort(self):
-        with pytest.raises(ValueError, match="no default_effort"):
-            ThinkingSupport(efforts=("low", "high"))
+    def test_efforts_without_a_default_effort_are_valid(self):
+        # None means no single level corresponds to the omitted state — the
+        # shape of the routed records, whose omitted-state behaviour is
+        # dynamic. Declaring the accepted levels does not require pretending
+        # one of them is the default.
+        support = ThinkingSupport(efforts=("low", "high"))
+        assert support.default_effort is None
+
+    def test_disabled_ceiling_needs_a_default_effort(self):
+        # The cap is evaluated at the omitted-state level for a request that
+        # disables thinking without naming an effort, so an entry declaring
+        # the cap must state that level.
+        with pytest.raises(ValueError, match="needs default_effort"):
+            ThinkingSupport(
+                modes=(THINKING_ADAPTIVE, THINKING_DISABLED),
+                efforts=("low", "high"), disabled_max_effort="high")
 
     def test_default_effort_must_be_declared(self):
         with pytest.raises(ValueError, match="must be one of the declared"):
@@ -653,33 +1002,45 @@ class TestRegistryThinkingDeclarations:
                               display="summarized"))
         assert dec["thinking"]["display"] == "summarized"
 
-    def test_a_declared_surface_is_the_minority_of_the_table(self):
-        # What the README and `thinking_support` both say, asserted rather than
-        # counted by hand: a thinking surface is declared on the live Anthropic
-        # entries and NOWHERE else, so most of the table has none. Undeclared
-        # does not mean "cannot think" — it means direktoro refuses to emit a
-        # thinking shape for that model rather than guessing one — and stating
-        # it the other way round would over-claim what has been verified.
-        from direktoro import MODEL_REGISTRY, PROVIDER_ANTHROPIC
+    def test_the_undeclared_surfaces_are_pinned(self):
+        # A surface is declared exactly where evidence exists: the live
+        # Anthropic entries (published reference) and four routed entries
+        # (live probes 2026-08-12) — including Qwen's, whose EMPTY surface is
+        # a probed fact. Undeclared means direktoro refuses a spec rather
+        # than guessing: the three retired ids (unverifiable), the GPT
+        # entries (no current reference read for their levels), and MiMo
+        # (probe rate-limited part-way; see its entry comment).
+        from direktoro import MODEL_REGISTRY
 
-        declared = sorted(model_id for model_id, info in MODEL_REGISTRY.items()
-                          if info.thinking is not None)
-        assert declared == sorted(
-            model_id for model_id, info in MODEL_REGISTRY.items()
-            if info.provider == PROVIDER_ANTHROPIC and not info.retired)
-        assert len(declared) < len(MODEL_REGISTRY) - len(declared), (
-            "a declared thinking surface is documented as the minority of the "
-            "table; if that has changed, the README says so too.")
+        undeclared = sorted(model_id for model_id, info in
+                            MODEL_REGISTRY.items() if info.thinking is None)
+        assert undeclared == sorted([
+            "claude-3-5-sonnet-20241022", "claude-opus-4-20250514",
+            "claude-sonnet-4-20250514", "gpt-5.6-sol", "gpt-5.6-terra",
+            "xiaomi/mimo-v2.5"])
 
-    def test_no_non_anthropic_entry_declares_a_surface(self):
-        # Declaring one would let the seam emit Anthropic keys onto a wire that
-        # does not have them; the provider gate in `_thinking_params` is the
-        # other half of that guard.
-        from direktoro import MODEL_REGISTRY, PROVIDER_ANTHROPIC
-        declared = [model_id for model_id, info in MODEL_REGISTRY.items()
-                    if info.provider != PROVIDER_ANTHROPIC
-                    and info.thinking is not None]
-        assert declared == []
+    def test_routed_probed_surfaces_say_what_the_probes_saw(self):
+        # The GLM pair: reasons by default, all five ladder levels route, and
+        # the wire off-switch works — and no Anthropic-only concept (display,
+        # budget) is declared for a wire that has none.
+        glm = thinking_support("z-ai/glm-4.6v")
+        assert glm.default_on is True
+        assert set(glm.efforts) == set(EFFORT_LEVELS)
+        assert THINKING_DISABLED in glm.modes
+        assert glm.displays == ()
+        assert glm.default_effort is None
+        assert thinking_support("z-ai/glm-5v-turbo") == glm
+        # Gemini 3.6 Flash: reasons by default and CANNOT be disabled (the
+        # probe's 400: "Reasoning is mandatory for this endpoint").
+        gem = thinking_support("google/gemini-3.6-flash")
+        assert gem.default_on is True
+        assert THINKING_DISABLED not in gem.modes
+        assert set(gem.efforts) == set(EFFORT_LEVELS)
+        # Qwen instruct: no reasoning surface at all, declared as a fact.
+        qwen = thinking_support("qwen/qwen3-vl-235b-a22b-instruct")
+        assert qwen.modes == ()
+        assert qwen.efforts == ()
+        assert qwen.default_on is False
 
 
 def _anthropic_entries():

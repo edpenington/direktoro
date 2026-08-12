@@ -194,14 +194,16 @@ which table priced it.
 - **Model registry** — 16 entries: eleven direct (Anthropic and OpenAI) and
   five routed through OpenRouter. Each records provider, base URL, key
   environment variable, wire protocol, and capability flags for vision, forced
-  tool choice and sampling controls. Six of the sixteen — the live Anthropic
-  entries — additionally declare a thinking surface, five of those with a
-  reasoning-effort ladder (the pre-4.6 entry errors on an effort parameter, so
-  it declares none). On the other ten the surface is *undeclared*, which means
-  direktoro refuses to emit a thinking shape for them rather than guessing one,
-  not that they cannot think. An unknown id raises and lists what is known,
-  separating the ids that can start a new run from the retired ones that resolve
-  only so past runs stay citable.
+  tool choice (stated per entry, never defaulted) and sampling controls,
+  including the documented value range per sampling param where one is
+  published. Ten of the sixteen declare a thinking surface: the six live
+  Anthropic entries from the published reference, and four routed entries from
+  live probes — one of which declares an *empty* surface, an instruct endpoint
+  probed to take no reasoning parameter at all. On the other six the surface is
+  *undeclared*, which means direktoro refuses to emit a thinking shape for them
+  rather than guessing one, not that they cannot think. An unknown id raises
+  and lists what is known, separating the ids that can start a new run from the
+  retired ones that resolve only so past runs stay citable.
 
 - **Price table** — `direktoro.prices`, a dated reading of the vendors'
   published rates for the direct models: input, output, cached reads and
@@ -222,13 +224,17 @@ which table priced it.
   `direktoro-smoke` applies them at config load.
 
 - **Thinking and reasoning effort** — a per-call `Thinking` spec validated
-  against the registry's per-model `ThinkingSupport`. Because the registry knows
-  each model's family, a request the endpoint would answer with a 400 —
-  `budget_tokens` on a family that removed it, an effort level a model does not
-  have, a temperature on a request that also turns thinking on — raises
-  `ThinkingUnsupported` before a client exists. Effort and mode reach the
-  call-identity block through the decoding params, so two runs differing only in
-  effort record differently.
+  against the registry's per-model `ThinkingSupport` and rendered for the
+  model's wire: Anthropic's `thinking` / `output_config` keys, or the single
+  OpenAI-family reasoning level, where disabling rides as `"none"`. Because the
+  registry knows each model's surface, a request the endpoint would answer with
+  a 400 — `budget_tokens` on a family that removed it, an effort level a model
+  does not have, a temperature on a request that also turns thinking on —
+  raises `ThinkingUnsupported` before a client exists; so does a `max_tokens` a
+  thinking call cannot answer within, which the endpoint would accept and then
+  spend entirely on reasoning. Effort and mode reach the call-identity block
+  through the decoding params, so two runs differing only in effort record
+  differently.
 
 - **Routing and provenance** — a routed entry carries a `Route` pinning the
   upstream provider, refusing fallbacks, refusing endpoints that would silently

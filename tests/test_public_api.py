@@ -35,6 +35,7 @@ EXPECTED_PUBLIC_API = [
     "create_message_with_retry",
     "extract_tool_call",
     "resolved_decoding_params",
+    "split_decoding_config",
     "tool_choice_named",
     "ProviderError",
     "ProviderRateLimitError",

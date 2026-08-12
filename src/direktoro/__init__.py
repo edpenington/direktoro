@@ -32,6 +32,7 @@ from direktoro.providers import (
     create_message_with_retry,
     extract_tool_call,
     resolved_decoding_params,
+    split_decoding_config,
     tool_choice_named,
 )
 from direktoro.cost import cost_from_rates, cost_from_usage
@@ -108,8 +109,13 @@ __all__ = [
     # Forced-named-tool helpers
     "tool_choice_named",
     "extract_tool_call",
-    # Decoding params (single source of truth)
+    # Decoding params (single source of truth), and the splitter that takes
+    # one role's decoding block from an application config — sampling controls
+    # and thinking_* fields side by side — and returns the (sampling,
+    # thinking) pair the resolver takes, so the application carries the block
+    # without knowing which key is which.
     "resolved_decoding_params",
+    "split_decoding_config",
     # Thinking / reasoning-effort seam. `Thinking` is the per-call request
     # spec; `ThinkingSupport` is the registry's per-model capability record;
     # `ThinkingUnsupported` is raised BEFORE the call when the registry knows

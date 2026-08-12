@@ -314,9 +314,12 @@ def run_dry(models, args):
     and full canonical request as JSON. No client, no key, no network.
 
     This is also the free way to see exactly what `--thinking` / `--effort`
-    would put on the wire, and to see the seam REFUSE a shape a model would
-    reject: a `ThinkingUnsupported` is reported per model and the run continues
-    with a non-zero exit, rather than aborting the whole matrix."""
+    would put on the wire, and to see the resolver REFUSE a shape a model
+    would reject — a thinking spec its surface does not take, a sampling
+    value outside its documented band, a cap a reasoning call cannot answer
+    within. Each refusal is a per-model fact, so it is reported per model and
+    the run continues with a non-zero exit, rather than aborting the whole
+    matrix."""
     thinking = thinking_from_args(args)
     refused = 0
     for label, model_id in models:
@@ -329,9 +332,11 @@ def run_dry(models, args):
             resolved = resolved_decoding_params(
                 model_id, sampling=_sampling_from_args(args),
                 max_tokens=args.max_tokens, thinking=thinking)
-        except ThinkingUnsupported as e:
+        except ValueError as e:
+            # ThinkingUnsupported is a ValueError; the band and cap refusals
+            # are plain ones. All are per-model config infeasibility.
             refused += 1
-            print(f"    REFUSED (thinking): {e}")
+            print(f"    REFUSED: {e}")
             print()
             continue
         request = build_request(
@@ -525,8 +530,10 @@ def build_arg_parser():
              "would reject is refused before the call, not after.")
     p.add_argument(
         "--effort", choices=EFFORT_LEVELS, default=None,
-        help="Reasoning effort to request (Anthropic output_config.effort). "
-             "Omitted by default. Levels a model does not have are refused.")
+        help="Reasoning effort to request, rendered for the model's wire "
+             "(Anthropic output_config.effort; the single OpenAI-family "
+             "reasoning level elsewhere). Omitted by default. Levels a "
+             "model's entry does not declare are refused.")
     p.add_argument(
         "--thinking-budget", type=_positive_int, default=None, metavar="N",
         help="Thinking-token budget for --thinking budget (pre-4.6 models "

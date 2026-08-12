@@ -425,6 +425,50 @@ class TestSamplingBands:
             Model("anthropic", None, "K", forced_tool_choice=True,
                   sampling_bands={"temperature": band})
 
+    def test_out_of_band_value_is_refused_before_spend(self):
+        # Anthropic documents temperature 0.0-1.0, so 1.5 — which a
+        # cross-provider union bound would pass to the endpoint to 400 on a
+        # paid call — is refused by the resolver.
+        with pytest.raises(ValueError, match="outside the range"):
+            resolved_decoding_params(
+                "claude-sonnet-4-6", sampling={"temperature": 1.5},
+                max_tokens=4096)
+
+    def test_in_band_values_pass_and_the_band_is_per_model(self):
+        dec = resolved_decoding_params(
+            "claude-sonnet-4-6", sampling={"temperature": 1.0},
+            max_tokens=4096)
+        assert dec["temperature"] == 1.0
+        # The same 1.5 is fine on the gateway surface, whose documented range
+        # runs to 2.0 — which is the whole point of a per-model band.
+        dec = resolved_decoding_params(
+            "z-ai/glm-4.6v", sampling={"temperature": 1.5}, max_tokens=4096)
+        assert dec["temperature"] == 1.5
+        with pytest.raises(ValueError, match="outside the range"):
+            resolved_decoding_params(
+                "z-ai/glm-4.6v", sampling={"temperature": 2.5},
+                max_tokens=4096)
+
+    def test_a_param_with_no_band_passes_through(self):
+        # No range is published for Anthropic's top_k, so nothing is refused;
+        # the endpoint's own answer settles it.
+        dec = resolved_decoding_params(
+            "claude-sonnet-4-6", sampling={"top_k": 99999}, max_tokens=4096)
+        assert dec["top_k"] == 99999
+
+    def test_a_non_numeric_value_is_refused_where_a_band_exists(self):
+        with pytest.raises(ValueError, match="not a number"):
+            resolved_decoding_params(
+                "claude-sonnet-4-6", sampling={"temperature": "hot"},
+                max_tokens=4096)
+
+    def test_a_rejected_param_is_dropped_before_the_band_is_read(self):
+        # Opus 5 refuses temperature outright; the declared refusal drops it
+        # (honest omission) and no band is consulted, however wild the value.
+        dec = resolved_decoding_params(
+            "claude-opus-5", sampling={"temperature": 9.9}, max_tokens=4096)
+        assert "temperature" not in dec
+
 
 class TestModelInfoErrors:
     def test_unknown_model_raises(self):
@@ -553,7 +597,7 @@ class TestAnthropicCapabilityBlock:
         # param from what is sent (and from the fingerprint), so assert the
         # effect, not the flag.
         dec = resolved_decoding_params(model_id, sampling={"temperature": 0.0},
-                                       max_tokens=100)
+                                       max_tokens=4096)
         assert ("temperature" in dec) is not no_temp
 
     @pytest.mark.parametrize("model_id,no_temp", VERIFIED)
@@ -585,7 +629,7 @@ class TestSonnet5Entry:
         assert model_info("claude-sonnet-5").rejects_sampling == frozenset(
             SAMPLING_PARAMS)
         dec = resolved_decoding_params("claude-sonnet-5", sampling={"temperature": 0.0},
-                                       max_tokens=100)
+                                       max_tokens=4096)
         assert "temperature" not in dec
 
     def test_sonnet_4_6_still_takes_temperature(self):
@@ -613,7 +657,7 @@ class TestOpus5Entry:
         assert model_info("claude-opus-5").rejects_sampling == frozenset(
             SAMPLING_PARAMS)
         dec = resolved_decoding_params("claude-opus-5", sampling={"temperature": 0.0},
-                                       max_tokens=100)
+                                       max_tokens=4096)
         assert "temperature" not in dec
 
 
@@ -720,11 +764,11 @@ class TestRoutedFrontierEntries:
         # truth for wire AND fingerprint) omits temperature for the no-sampling
         # model but keeps it for a sampling-capable routed peer.
         gem = resolved_decoding_params(
-            "google/gemini-3.6-flash", sampling={"temperature": 0.0}, max_tokens=64)
-        assert gem == {"max_tokens": 64}
+            "google/gemini-3.6-flash", sampling={"temperature": 0.0}, max_tokens=4096)
+        assert gem == {"max_tokens": 4096}
         mimo = resolved_decoding_params(
-            "xiaomi/mimo-v2.5", sampling={"temperature": 0.0}, max_tokens=64)
-        assert mimo == {"max_tokens": 64, "temperature": 0.0}
+            "xiaomi/mimo-v2.5", sampling={"temperature": 0.0}, max_tokens=4096)
+        assert mimo == {"max_tokens": 4096, "temperature": 0.0}
 
 
 # ---------------------------------------------------------------------------

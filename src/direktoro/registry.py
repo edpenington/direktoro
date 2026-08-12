@@ -179,11 +179,11 @@ PROVIDER_OPENROUTER = "openrouter"        # OpenAI-compat wire via the gateway
 WIRE_RESPONSES = "responses"
 WIRE_CHAT_COMPLETIONS = "chat_completions"
 
-# Reasoning-effort levels, ASCENDING. The Anthropic wire spells this
-# `output_config: {"effort": ...}`; the OpenAI families spell the same idea
-# `reasoning_effort` (Chat Completions) / `reasoning: {"effort": ...}`
-# (Responses) and today take it from the per-model `reasoning_effort` quirk
-# rather than from the per-call thinking seam. Order matters: it is how
+# Reasoning-effort levels, ASCENDING — the vocabulary a caller picks from,
+# validated per entry against `ThinkingSupport.efforts`. The Anthropic wire
+# spells a level `output_config: {"effort": ...}`; the OpenAI families spell
+# the same idea `reasoning_effort` (Chat Completions) / `reasoning:
+# {"effort": ...}` (Responses). Order matters: it is how
 # `ThinkingSupport.disabled_max_effort` is compared.
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 
@@ -241,9 +241,13 @@ class ThinkingSupport:
         non-thinking model buys less answer on a thinking one. Consumers read
         it via `thinking_support(model).default_on` to size caps honestly.
       - `default_effort`: the effort level in force when `output_config.effort`
-        is omitted (Anthropic: "high"), or None when the endpoint has no effort
-        parameter. Used to evaluate `disabled_max_effort` for a request that
-        disables thinking without naming an effort.
+        is omitted (Anthropic: "high"), or None when no single level
+        corresponds to the omitted state — an endpoint with no effort
+        parameter at all, or a gateway-served entry whose omitted-state
+        behaviour is dynamic rather than a level (the routed records below).
+        Required alongside `disabled_max_effort`, whose cap is evaluated at
+        the omitted-state level for a request that disables thinking without
+        naming an effort.
       - `disabled_max_effort`: the HIGHEST effort at which `{"type":
         "disabled"}` is accepted; None means no cap. Claude Opus 5 caps this at
         "high" — pairing disabled thinking with `xhigh` or `max` returns a 400,
@@ -264,8 +268,13 @@ class ThinkingSupport:
 
     A model whose entry leaves `thinking` as None is UNDECLARED, not
     unsupported: the seam refuses any explicit thinking spec for it and says so,
-    rather than guessing a shape. That is why adding this field is additive —
-    nothing declares it except the entries whose behaviour was verified.
+    rather than guessing a shape. Adding this field is additive for the seam's
+    TRANSLATIONS — nothing declares it except the entries whose behaviour was
+    verified — but declaring `default_on=True` also arms the starving-cap
+    guard (`providers._refuse_starving_cap`), so a spec-less call that
+    resolved before the declaration can be refused after it. That is the
+    point of declaring, and it is said here so nobody reads "additive" as
+    "changes no call's admissibility".
     """
 
     modes: tuple = ()
@@ -292,11 +301,6 @@ class ThinkingSupport:
                 raise ValueError(
                     f"ThinkingSupport.default_effort {self.default_effort!r} "
                     f"must be one of the declared efforts {list(self.efforts)}")
-        elif self.efforts:
-            raise ValueError(
-                "ThinkingSupport declares effort levels but no default_effort; "
-                "the level in force when `effort` is omitted must be stated so "
-                "the disabled-thinking effort cap can be evaluated.")
         if self.disabled_max_effort is not None:
             if THINKING_DISABLED not in self.modes:
                 raise ValueError(
@@ -307,6 +311,12 @@ class ThinkingSupport:
                     f"ThinkingSupport.disabled_max_effort "
                     f"{self.disabled_max_effort!r} must be one of the declared "
                     f"efforts {list(self.efforts)}")
+            if self.default_effort is None:
+                raise ValueError(
+                    "ThinkingSupport.disabled_max_effort needs default_effort: "
+                    "a request that disables thinking without naming an effort "
+                    "is evaluated at the level in force when `effort` is "
+                    "omitted, which must therefore be stated.")
         for display in self.displays:
             if display not in THINKING_DISPLAYS:
                 raise ValueError(
@@ -339,15 +349,16 @@ class Model:
         (sampling) or refuses the call (thinking). An unspecified one is
         absent from the wire and from call identity, and the provider's own
         default applies — a fact about the provider, not about this table.
-      - REGISTRY-SUPPLIED. This record chose it, and the caller has no say:
-        `quirks["reasoning_effort"]` is the only member. It is sent on every
-        call to the entries that declare it and folds into call identity like
-        any other sent param, but it is never something a caller can be told
-        it "configured in vain", because it configured nothing.
+      - REGISTRY-DEFAULTED. This record supplies it when the caller says
+        nothing: `quirks["reasoning_effort"]` is the only member. It is sent
+        on a spec-less call to the entries that declare it and folds into
+        call identity like any other sent param; a caller-chosen level,
+        named through a `Thinking` spec and validated against the entry's
+        declared `efforts`, takes its place on the wire and in identity.
 
     A caller-facing consumer reports an inert CALLER-SPECIFIED param (one it
     asked for that the endpoint will not take) and says nothing about either an
-    unspecified one or a registry-supplied one. Keeping the classes apart is
+    unspecified one or a registry-defaulted one. Keeping the classes apart is
     what makes that reporting possible.
 
     `quirks` carries provider-specific decoding rules read by the adapters:
@@ -355,18 +366,11 @@ class Model:
       - `reasoning_effort`: an OpenAI reasoning-effort level ("low" | "medium"
         | "high") the OpenAI adapter passes as `reasoning={"effort": ...}` on
         the Responses wire, or as `reasoning_effort` on the Chat Completions
-        wire. REGISTRY-SUPPLIED, per the split above, and the ONLY member of
-        that class — so it is worth saying exactly what keeps it there, since
-        it is not that the wire shape is unproven. That shape is emitted on
-        every call to these entries and works. What is Anthropic-shaped is the
-        CALLER's side: `ThinkingSupport` speaks in `output_config.effort`,
-        `thinking.display` and `budget_tokens`, and `EFFORT_LEVELS` is
-        Anthropic's own ladder, `xhigh` and `max` included. Letting a caller
-        pick a level from that vocabulary would let it name one this endpoint
-        400s on. Making effort caller-specifiable here therefore needs a
-        per-provider effort vocabulary, plus each entry's accepted levels from
-        its vendor's reference or a probe (see HOW A FACT GETS INTO THIS
-        TABLE) — a larger change than opening the gate.
+        wire, when the call carries no `Thinking` spec of its own.
+        REGISTRY-DEFAULTED, per the split above: a caller names its own level
+        through the thinking seam, validated against the entry's declared
+        `efforts`, and that level replaces this one on the wire and in
+        identity.
 
     `wire_api` selects the OpenAI-family wire protocol (`WIRE_RESPONSES` or
     `WIRE_CHAT_COMPLETIONS`); it is read only by the OpenAI adapter and ignored
@@ -682,6 +686,57 @@ _THINK_BUDGET_ONLY = ThinkingSupport(
     modes=(THINKING_BUDGET,), efforts=(), default_on=False,
     displays=_DISPLAYS_BOTH)
 
+# ---- Routed-entry thinking surfaces (live probes 2026-08-12) ---------------
+# Probed through the production pins (provider object, require_parameters,
+# zdr / data_collection as declared): one plain call, then one call per
+# `reasoning_effort` value in {low, medium, high, xhigh, max, minimal, none}.
+# "Accepted" means the pinned endpoint routed the call (200) under
+# require_parameters, which refuses an endpoint that does not support a sent
+# parameter.
+
+# The GLM vision pair (probed per entry, same Z.AI host): reasoning runs on a
+# plain call, so default_on; all five ladder levels are accepted; and
+# `reasoning_effort: "none"` returns zero reasoning tokens — the off-switch
+# that THINKING_DISABLED renders to on this wire. No level is documented or
+# observable as the omitted-state default, so default_effort stays None.
+# THE PROBE FOUND NO EVIDENCE THE LEVEL BOUNDS VOLUME: on one reasoning-heavy
+# prompt at cap 8192 (glm-4.6v, 3 samples per level), "low" consumed
+# 5292-8191 reasoning tokens and "max" 5902-8191, with samples at BOTH levels
+# censored at the cap — too small and too truncated to establish a per-level
+# bound in either direction. Declaring a level buys the wire fact; treat any
+# spend expectation attached to it as unmeasured.
+_THINK_GLM_VISION = ThinkingSupport(
+    modes=(THINKING_ADAPTIVE, THINKING_DISABLED),
+    efforts=("low", "medium", "high", "xhigh", "max"),
+    default_on=True)
+
+# Gemini 3.6 Flash at the pinned Vertex flex endpoint: reasoning runs on a
+# plain call; all five ladder levels are accepted at the wire, which is what
+# `efforts` declares. Two honesty notes on what acceptance does NOT establish:
+# per-level reasoning volumes were non-monotone at one sample per level
+# (low 91, medium 100, high 130, xhigh 120, max 109 tokens); and OpenRouter's
+# reference maps effort onto Google's thinkingLevel with "xhigh" folding to
+# "high" upstream (gateway docs read 2026-08-12) and no stated mapping for
+# "max" — so two declared levels can denote one served behaviour while
+# fingerprinting as what was sent. `reasoning_effort: "none"` is REFUSED —
+# 400 "Reasoning is mandatory for this endpoint and cannot be disabled" — so
+# there is no disabled mode. ("minimal" was also accepted and returned zero
+# reasoning tokens, but it is not a ladder level and nothing here emits it.)
+_THINK_GEMINI_FLASH = ThinkingSupport(
+    modes=(THINKING_ADAPTIVE,),
+    efforts=("low", "medium", "high", "xhigh", "max"),
+    default_on=True)
+
+# Qwen3-VL 235B Instruct: an instruct, non-reasoning endpoint. Every
+# reasoning_effort value 404s under require_parameters ("no endpoints found
+# that can handle the requested parameters") and a plain call produces no
+# reasoning tokens. Declared EMPTY rather than left undeclared — the absence
+# of a thinking surface is a probed fact here, not a gap — and each field is
+# stated rather than defaulted, because a value left at its field default
+# records nothing (module docstring). budget_min keeps its inert default:
+# there is no reasoning parameter for it to be a minimum of.
+_THINK_QWEN_INSTRUCT = ThinkingSupport(modes=(), efforts=(), default_on=False)
+
 
 MODEL_REGISTRY = {
     # ---- Anthropic (Claude) -------------------------------------------------
@@ -857,6 +912,7 @@ MODEL_REGISTRY = {
         # TOOL-CALLING CAVEAT above).
         forced_tool_choice=False,
         sampling_bands=_OPENROUTER_SURFACE_BANDS,
+        thinking=_THINK_GLM_VISION,
         route=Route(gateway=GATEWAY_OPENROUTER, upstream=("z-ai",),
                     quantizations=("fp8",))),
     # GLM 4.6V: served by both Z.AI (fp8) and Novita (bf16); pinned to Z.AI
@@ -869,6 +925,7 @@ MODEL_REGISTRY = {
         # endpoints, confirmed live 2026-07-23): runs "auto" + retry.
         forced_tool_choice=False,
         sampling_bands=_OPENROUTER_SURFACE_BANDS,
+        thinking=_THINK_GLM_VISION,
         route=Route(gateway=GATEWAY_OPENROUTER, upstream=("z-ai",),
                     quantizations=("fp8",))),
     # Qwen3-VL flagship (235B-A22B Instruct), pinned to Venice + Parasail at fp8.
@@ -904,6 +961,7 @@ MODEL_REGISTRY = {
         # discipline is spelled out there).
         forced_tool_choice=True,
         sampling_bands=_OPENROUTER_SURFACE_BANDS,
+        thinking=_THINK_QWEN_INSTRUCT,
         route=Route(gateway=GATEWAY_OPENROUTER, upstream=("venice", "parasail"),
                     quantizations=("fp8",))),
     # Xiaomi MiMo v2.5, pinned to Parasail + Venice at fp8. Vision + prompt
@@ -941,6 +999,13 @@ MODEL_REGISTRY = {
         # (live-confirmed 2026-07-23; see the FORCED-TOOL-CHOICE note above).
         forced_tool_choice=False,
         sampling_bands=_OPENROUTER_SURFACE_BANDS,
+        # THINKING SURFACE: UNDECLARED, with the partial probe findings
+        # recorded (2026-08-12): a plain call reasons, and reasoning_effort
+        # low / xhigh / minimal were accepted with "none" returning zero
+        # reasoning tokens — but Parasail rate-limited the probes for
+        # medium / high / max, so the ladder is unestablished and a partial
+        # `efforts` tuple would read as refusals nobody observed. Left None
+        # until the remaining levels are probed.
         route=Route(gateway=GATEWAY_OPENROUTER,
                     upstream=("parasail", "venice"),
                     quantizations=("fp8",))),
@@ -999,6 +1064,7 @@ MODEL_REGISTRY = {
         # and fingerprint, and let the require_parameters 404 be the loud backstop.
         # top_k is not named: its absence from that list was not established.
         rejects_sampling=frozenset({"temperature", "top_p"}),
+        thinking=_THINK_GEMINI_FLASH,
         route=Route(gateway=GATEWAY_OPENROUTER,
                     upstream=("google-vertex/global/flex",),
                     quantizations=())),

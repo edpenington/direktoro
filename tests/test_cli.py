@@ -264,7 +264,7 @@ class TestThinkingIsReachableFromTheFlags:
         assert cli.main([
             "--models", self.ADAPTIVE_MODEL, "--thinking", "adaptive",
             "--temperature", "0.0"]) == 1
-        assert "REFUSED (thinking)" in capsys.readouterr().out
+        assert "REFUSED" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------

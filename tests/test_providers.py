@@ -74,6 +74,9 @@ class TestOpenAIRequestTranslation:
         assert wire["instructions"] == "S"
 
     def test_gpt_omits_temperature_adds_reasoning(self):
+        # max_tokens=100 deliberately: the GPT entries declare no thinking
+        # surface, so the starving-cap guard is inert for them and a small
+        # cap still resolves — this doubles as that pin.
         wire, decoding = _to_openai_wire(
             model="gpt-5.6-sol", system="S", messages=[], tools=None,
             tool_choice=None, max_tokens=100, sampling={"temperature": 0.0})
@@ -256,7 +259,7 @@ class TestChatCompletionsRequestTranslation:
     def test_system_becomes_first_message(self):
         wire, _ = _to_chat_completions_wire(
             model="z-ai/glm-4.6v", system=[{"type": "text", "text": "SYS"}],
-            messages=[], tools=None, tool_choice=None, max_tokens=100,
+            messages=[], tools=None, tool_choice=None, max_tokens=4096,
             sampling={"temperature": 0.0})
         assert wire["messages"][0] == {"role": "system", "content": "SYS"}
 
@@ -274,7 +277,7 @@ class TestChatCompletionsRequestTranslation:
             model="z-ai/glm-4.6v", system="S", messages=[],
             tools=[{"name": "record_answer", "description": "d",
                     "input_schema": {"type": "object", "properties": {}}}],
-            tool_choice={"type": "auto"}, max_tokens=100, sampling={"temperature": 0.0})
+            tool_choice={"type": "auto"}, max_tokens=4096, sampling={"temperature": 0.0})
         assert wire["tools"][0] == {
             "type": "function",
             "function": {
@@ -288,10 +291,10 @@ class TestChatCompletionsRequestTranslation:
     def test_glm_keeps_temperature_no_reasoning(self):
         wire, decoding = _to_chat_completions_wire(
             model="z-ai/glm-4.6v", system="S", messages=[], tools=None,
-            tool_choice=None, max_tokens=100, sampling={"temperature": 0.0})
+            tool_choice=None, max_tokens=4096, sampling={"temperature": 0.0})
         assert wire["temperature"] == 0.0
         assert "reasoning_effort" not in wire
-        assert decoding == {"max_tokens": 100, "temperature": 0.0}
+        assert decoding == {"max_tokens": 4096, "temperature": 0.0}
 
     def test_gemini_36_omits_temperature_from_wire_and_decoding(self):
         # google/gemini-3.6-flash sets rejected_sampling_params=False (its Vertex
@@ -300,10 +303,10 @@ class TestChatCompletionsRequestTranslation:
         # decoding params (honest omission — the same dict feeds the fingerprint).
         wire, decoding = _to_chat_completions_wire(
             model="google/gemini-3.6-flash", system="S", messages=[], tools=None,
-            tool_choice=None, max_tokens=100, sampling={"temperature": 0.0})
+            tool_choice=None, max_tokens=4096, sampling={"temperature": 0.0})
         assert "temperature" not in wire
         assert "temperature" not in decoding
-        assert decoding == {"max_tokens": 100}
+        assert decoding == {"max_tokens": 4096}
 
     def test_tool_use_and_result_round_trip_through_messages(self):
         messages = [
@@ -457,7 +460,7 @@ class TestRoutedChatAdapter:
         resp = adapter.create_message(
             model="z-ai/glm-4.6v", system="S",
             messages=[{"role": "user", "content": "hi"}],
-            max_tokens=100, sampling={"temperature": 0.0})
+            max_tokens=4096, sampling={"temperature": 0.0})
         # No prompt_tokens_details: cached is zero, all input at full price.
         assert resp.usage.input_tokens == 1000
         assert resp.usage.cache_read_input_tokens == 0
@@ -470,7 +473,7 @@ class TestRoutedChatAdapter:
         resp = adapter.create_message(
             model="z-ai/glm-4.6v", system="S",
             messages=[{"role": "user", "content": "hi"}],
-            max_tokens=100, sampling={"temperature": 0.0})
+            max_tokens=4096, sampling={"temperature": 0.0})
         assert resp.content[0].type == "text"
         assert resp.content[0].text == "{\"ok\": true}"
         assert resp.stop_reason == "end_turn"
@@ -484,7 +487,7 @@ class TestRoutedChatAdapter:
         resp = adapter.create_message(
             model="z-ai/glm-4.6v", system="S",
             messages=[{"role": "user", "content": "hi"}],
-            max_tokens=100, sampling={"temperature": 0.0})
+            max_tokens=4096, sampling={"temperature": 0.0})
         assert resp.stop_reason == "max_tokens"
 
 
@@ -502,7 +505,7 @@ class TestRoutedPinAssertion:
             adapter.create_message(
                 model="z-ai/glm-4.6v", system="S",
                 messages=[{"role": "user", "content": "hi"}],
-                max_tokens=100, sampling={"temperature": 0.0})
+                max_tokens=4096, sampling={"temperature": 0.0})
 
     def test_absent_attribution_raises(self):
         sink = {}
@@ -512,7 +515,7 @@ class TestRoutedPinAssertion:
             adapter.create_message(
                 model="z-ai/glm-4.6v", system="S",
                 messages=[{"role": "user", "content": "hi"}],
-                max_tokens=100, sampling={"temperature": 0.0})
+                max_tokens=4096, sampling={"temperature": 0.0})
 
 
 class TestRoutedImageAndTool:
@@ -618,9 +621,9 @@ class TestAnthropicAdapter:
             model="claude-opus-4-8",
             system=[{"type": "text", "text": "S"}],
             messages=[{"role": "user", "content": "hi"}],
-            max_tokens=100, sampling={"temperature": 0.0})
+            max_tokens=4096, sampling={"temperature": 0.0})
         assert "temperature" not in sink["wire"]
-        assert resp.decoding_params == {"max_tokens": 100}
+        assert resp.decoding_params == {"max_tokens": 4096}
         assert resp.resolved_model == "claude-opus-4-8-20260601"
         # Usage passes through unchanged (Anthropic semantics are canonical).
         assert resp.usage.input_tokens == 10
@@ -635,9 +638,9 @@ class TestAnthropicAdapter:
         resp = adapter.create_message(
             model="claude-sonnet-4-6", system="S",
             messages=[{"role": "user", "content": "hi"}],
-            max_tokens=100, sampling={"temperature": 0.0})
+            max_tokens=4096, sampling={"temperature": 0.0})
         assert sink["wire"]["temperature"] == 0.0
-        assert resp.decoding_params == {"max_tokens": 100, "temperature": 0.0}
+        assert resp.decoding_params == {"max_tokens": 4096, "temperature": 0.0}
 
     def test_error_is_translated(self):
         # One of the two tests that genuinely needs the Anthropic SDK
@@ -682,7 +685,7 @@ class TestRoutedReceiptGuards:
             adapter.create_message(
                 model="z-ai/glm-4.6v", system="S",
                 messages=[{"role": "user", "content": "hi"}],
-                max_tokens=100, sampling={"temperature": 0.0})
+                max_tokens=4096, sampling={"temperature": 0.0})
 
     def test_missing_generation_id_raises(self):
         sink = {}
@@ -693,7 +696,7 @@ class TestRoutedReceiptGuards:
             adapter.create_message(
                 model="z-ai/glm-4.6v", system="S",
                 messages=[{"role": "user", "content": "hi"}],
-                max_tokens=100, sampling={"temperature": 0.0})
+                max_tokens=4096, sampling={"temperature": 0.0})
 
 
 # ---------------------------------------------------------------------------
@@ -734,7 +737,7 @@ class TestAnthropicCacheWriteTTLSplit:
         adapter = AnthropicAdapter(_AnthClient(response, sink))
         resp = adapter.create_message(
             model="claude-opus-4-8", system="S",
-            messages=[{"role": "user", "content": "hi"}], max_tokens=100)
+            messages=[{"role": "user", "content": "hi"}], max_tokens=4096)
 
         assert resp.usage.cache_creation_input_tokens == 1400
         assert resp.usage.cache_creation_5m_input_tokens == 400
@@ -1201,7 +1204,7 @@ class TestAnthropicStreamIsDrained:
 
         resp = AnthropicAdapter(_Client()).create_message(
             model="claude-opus-4-8", system="S",
-            messages=[{"role": "user", "content": "hi"}], max_tokens=100)
+            messages=[{"role": "user", "content": "hi"}], max_tokens=4096)
 
         assert stream.consumed == ["par", "tial", " text"]
         assert resp.raw_response is response

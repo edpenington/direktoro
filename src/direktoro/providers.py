@@ -327,6 +327,72 @@ class Thinking:
                     f" or mode={THINKING_BUDGET!r} alongside it.")
 
 
+# The thinking fields a per-role decoding block in an application config may
+# carry, mapped config-key -> `Thinking` field.
+_CONFIG_THINKING_KEYS = {
+    "thinking_mode": "mode",
+    "thinking_effort": "effort",
+    "thinking_budget_tokens": "budget_tokens",
+    "thinking_display": "display",
+}
+
+
+def split_decoding_config(mapping):
+    """Split one role's decoding block from an application config.
+
+    The block is the caller's own YAML/JSON mapping, carried opaquely: the
+    sampling controls (`SAMPLING_PARAMS`) and the thinking fields
+    (`thinking_mode`, `thinking_effort`, `thinking_budget_tokens`,
+    `thinking_display`) side by side, so the application never needs to know
+    which key is which — this function is what knows.
+
+    Returns `(sampling, thinking)`, exactly the two arguments
+    `resolved_decoding_params` takes: a dict of the named sampling controls
+    or None when none were named, and a `Thinking` spec or None. An unknown
+    key raises ValueError naming what is accepted, so a misspelled control
+    fails at config load instead of being silently dropped. Value validation
+    happens where it always happens — the `Thinking` constructor for the
+    spec's shape, `resolved_decoding_params` for what the model's endpoint
+    accepts — so this function adds no second opinion on either. A key set
+    to null reads as unspecified, same as the resolver's own convention, so
+    a config may carry a fixed key set and leave values empty.
+    """
+    if mapping is None:
+        return None, None
+    if not isinstance(mapping, dict):
+        raise ValueError(
+            f"a decoding block must be a mapping of parameter names to "
+            f"values, got {type(mapping).__name__}.")
+    # key=str so a malformed block with a non-string key still raises THIS
+    # error, naming the key, rather than a TypeError from sorting.
+    unknown = sorted(set(mapping) - set(SAMPLING_PARAMS)
+                     - set(_CONFIG_THINKING_KEYS), key=str)
+    if unknown:
+        raise ValueError(
+            f"unknown decoding key(s) {unknown}; a decoding block accepts "
+            f"the sampling controls {list(SAMPLING_PARAMS)} and the thinking "
+            f"fields {sorted(_CONFIG_THINKING_KEYS)}.")
+    sampling = {}
+    for k in SAMPLING_PARAMS:
+        v = mapping.get(k)
+        if v is None:
+            # Null reads as unspecified, sampling and thinking keys alike.
+            continue
+        # YAML spells one intent two ways (`0` and `0.0`), and the resolved
+        # value folds into call identity byte-for-byte, so the float-valued
+        # controls are normalised here: two configs that mean the same call
+        # must not fingerprint apart. top_k is integral and is left alone.
+        if k in ("temperature", "top_p") and isinstance(v, (int, float)) \
+                and not isinstance(v, bool):
+            v = float(v)
+        sampling[k] = v
+    spec = {attr: mapping[key]
+            for key, attr in _CONFIG_THINKING_KEYS.items()
+            if mapping.get(key) is not None}
+    thinking = Thinking(**spec) if spec else None
+    return (sampling or None), thinking
+
+
 def _checked_display(model, support, display):
     """`display` if `model` accepts it, else refuse before the call is billed.
 
@@ -354,38 +420,22 @@ def _thinking_params(model, info, thinking, *, max_tokens):
 
     Validates the request against the model's registry `ThinkingSupport` and
     raises `ThinkingUnsupported` for anything the endpoint would reject, so the
-    400 never happens on a paid call. Returns Anthropic wire keys (`thinking`,
-    `output_config`) which merge straight into the Anthropic request.
+    400 never happens on a paid call. The keys depend on the wire: Anthropic
+    gets `thinking` / `output_config`, which merge straight into the Anthropic
+    request; the OpenAI-family wires resolve to a single `reasoning_effort`
+    level (see `_openai_family_thinking_params`), which the Responses branch
+    re-spells as `reasoning: {"effort": ...}`.
 
     One case is satisfied rather than refused: asking to DISABLE thinking on a
-    model that does not accept `{"type": "disabled"}` but also does not think
-    unless asked emits nothing, because omitting the parameter already gives
-    exactly the requested behaviour. The caller gets what it asked for and the
+    model that does not accept an off-switch but also does not think unless
+    asked emits nothing, because omitting the parameter already gives exactly
+    the requested behaviour. The caller gets what it asked for and the
     identity block records the same absence a `thinking=None` call would, which
     is honest: the two calls are byte-identical on the wire and behave
     identically.
     """
     if thinking is None:
         return {}
-
-    # The thinking parameter and output_config.effort are ANTHROPIC wire keys,
-    # and so is the vocabulary a caller picks from: `EFFORT_LEVELS` carries
-    # Anthropic's ladder, `xhigh` and `max` included. Accepting a spec here for
-    # another family would let a caller name a level that family's endpoint
-    # 400s on. The emission is not the obstacle — `resolved_decoding_params`
-    # already writes `reasoning={"effort": ...}` / `reasoning_effort` on those
-    # wires from the registry quirk — so what this refusal is waiting on is a
-    # per-provider effort vocabulary, not a proof that the wire works.
-    if info.provider != PROVIDER_ANTHROPIC:
-        raise ThinkingUnsupported(
-            f"model {model!r} is served by {info.provider!r}, and the per-call "
-            f"thinking seam takes Anthropic wire keys (`thinking`, "
-            f"`output_config.effort`) and Anthropic's effort ladder. Reasoning "
-            f"effort for the OpenAI-family and gateway-routed endpoints comes "
-            f"from the model's `reasoning_effort` quirk in the registry; "
-            f"making it caller-specifiable needs a per-provider effort "
-            f"vocabulary, so that a level this endpoint rejects cannot be "
-            f"named here.")
 
     support = info.thinking
     if support is None:
@@ -394,6 +444,9 @@ def _thinking_params(model, info, thinking, *, max_tokens):
             f"direktoro will not guess a shape its endpoint accepts. Add a "
             f"`thinking=ThinkingSupport(...)` to its registry entry, recording "
             f"the modes and effort levels the endpoint was verified to take.")
+
+    if info.provider != PROVIDER_ANTHROPIC:
+        return _openai_family_thinking_params(model, info, support, thinking)
 
     params = {}
 
@@ -494,6 +547,99 @@ def _thinking_params(model, info, thinking, *, max_tokens):
     return params
 
 
+def _openai_family_thinking_params(model, info, support, thinking):
+    """The OpenAI-family rendering of a thinking spec: one reasoning level.
+
+    These wires carry a single reasoning control — `reasoning_effort` on Chat
+    Completions, `reasoning: {"effort": ...}` on Responses — so a spec
+    resolves to at most one level string, returned here under the Chat
+    Completions spelling:
+
+      - a named EFFORT is validated against the entry's declared levels and
+        sent as itself;
+      - mode "disabled" is sent as the level "none" — the off-switch the
+        endpoints declaring the disabled mode were probed to honour (zero
+        reasoning tokens; live 2026-08-12) — and cannot be combined with a
+        named effort, since one wire key cannot carry two levels;
+      - mode "adaptive" alone emits nothing: on an endpoint that reasons by
+        default it IS the omitted-state behaviour, and emitting a level for
+        it would fold a value into call identity that nobody chose.
+
+    `budget_tokens` and `display` are Anthropic wire concepts with no
+    rendering on these wires, so a spec carrying either is refused rather
+    than partly honoured.
+    """
+    if thinking.budget_tokens is not None:
+        raise ThinkingUnsupported(
+            f"model {model!r} is served by {info.provider!r}, whose wire has "
+            f"no `budget_tokens`: a fixed thinking budget cannot be rendered "
+            f"for it. Name an effort instead, or drop the spec.")
+    if thinking.display is not None:
+        raise ThinkingUnsupported(
+            f"model {model!r} is served by {info.provider!r}, whose wire has "
+            f"no `thinking.display`: the setting cannot be rendered for it.")
+
+    params = {}
+    if thinking.effort is not None:
+        if thinking.effort not in support.efforts:
+            accepted = list(support.efforts)
+            raise ThinkingUnsupported(
+                f"model {model!r} does not accept reasoning effort "
+                f"{thinking.effort!r}"
+                + (f"; it accepts {accepted}." if accepted else
+                   "; its endpoint takes no reasoning-effort parameter at "
+                   "all.")
+                + " The call would fail after it was billed.")
+        params["reasoning_effort"] = thinking.effort
+
+    mode = thinking.mode
+    if mode is None:
+        return params
+
+    if mode == THINKING_ADAPTIVE:
+        if THINKING_ADAPTIVE not in support.modes:
+            raise ThinkingUnsupported(
+                f"model {model!r} does not accept adaptive thinking; it "
+                f"accepts {list(support.modes)}.")
+        return params
+
+    if mode == THINKING_DISABLED:
+        # A wire property, so it is checked before any entry property: this
+        # wire carries ONE reasoning level, and disabling rides it, so the
+        # contradictory pair is refused whether or not the entry declares an
+        # off-switch — an entry-first check would silently drop both halves
+        # on an entry that declares none.
+        if thinking.effort is not None:
+            raise ThinkingUnsupported(
+                f"Thinking(mode='disabled', effort={thinking.effort!r}) "
+                f"cannot be rendered for model {model!r}: this wire carries "
+                f"ONE reasoning level, disabling rides it as \"none\", and a "
+                f"second level cannot be sent alongside. Drop one of the two.")
+        if THINKING_DISABLED not in support.modes:
+            if support.default_on:
+                raise ThinkingUnsupported(
+                    f"model {model!r} reasons by default and its endpoint "
+                    f"refuses the off-switch, so thinking cannot be turned "
+                    f"off on it; it accepts {list(support.modes)}.")
+            if (info.quirks or {}).get("reasoning_effort"):
+                raise ThinkingUnsupported(
+                    f"model {model!r} sends its registry-default reasoning "
+                    f"level on every call and its endpoint declares no "
+                    f"off-switch, so a disabled request cannot be honoured "
+                    f"by omission — the default would run anyway.")
+            # Omitting the parameter already means "no reasoning" here, so
+            # the request is satisfied by emitting nothing. See the
+            # docstring: same wire, same behaviour, same identity.
+            return {}
+        return {"reasoning_effort": "none"}
+
+    # THINKING_BUDGET (a budget WITH tokens was already refused above).
+    raise ThinkingUnsupported(
+        f"model {model!r} is served by {info.provider!r}, whose wire has no "
+        f"fixed thinking budget; Thinking(mode='budget') cannot be rendered "
+        f"for it.")
+
+
 # The `thinking.type` values that mean thinking is ACTIVE for this request.
 # `disabled` is not one of them, and an effort-only spec emits no thinking key
 # at all.
@@ -553,6 +699,107 @@ def _refuse_sampling_with_thinking(model, sending, thinking_params):
         f"sampling controls outright, so this layer already omits them.)")
 
 
+def _refuse_out_of_band_sampling(model, info, sending):
+    """Refuse a sampling value outside the model's documented range.
+
+    `Model.sampling_bands` records, per param, the (low, high) range the
+    endpoint's reference documents. A value outside it fails at the endpoint —
+    after the reviewer-stage run ahead of it has already been billed, if the
+    caller exercises roles in sequence — so it is refused here, before any
+    spend, by the one layer that knows which model the value is bound for.
+    A param with no declared band passes through: nothing was established,
+    and the endpoint's own answer settles it.
+    """
+    for name in SAMPLING_PARAMS:
+        if name not in sending:
+            continue
+        band = info.sampling_bands.get(name)
+        if band is None:
+            continue
+        value = sending[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                f"{name}={value!r} for model {model!r} is not a number; the "
+                f"endpoint documents a numeric range {band[0]} to {band[1]}.")
+        if not band[0] <= value <= band[1]:
+            raise ValueError(
+                f"{name}={value} is outside the range {band[0]} to {band[1]} "
+                f"documented for model {model!r} (see its registry entry); "
+                f"the endpoint refuses it, so it is refused here before the "
+                f"call is billed.")
+
+
+# The floor for `_refuse_starving_cap`: DIREKTORO'S OWN POLICY FIGURE, not an
+# endpoint fact — no vendor documents a minimum viable cap for a reasoning
+# call, and asserting one as theirs would outrun the evidence. 2048 is small
+# enough that any deliberately sized cap clears it (Anthropic's migration
+# guidance starts `max_tokens` at 64000 for the top efforts, thirty times
+# higher) and large enough to catch a cap that is wrong by construction. The
+# guard exists to catch those, never to size caps.
+_THINKING_CAP_FLOOR = 2048
+
+
+def _reason_the_call_thinks(info, thinking):
+    """Why this call runs reasoning, or None when it does not.
+
+    Returns a short cause phrase for `_refuse_starving_cap`'s message: an
+    explicit on-mode; a named effort on a wire whose single reasoning dial
+    turning-on IS the effort key; or the entry's declared `default_on` with
+    nothing disabling it. An entry with no declared `ThinkingSupport` returns
+    None — nothing was established, so there is nothing to guard.
+    """
+    support = info.thinking
+    if support is None:
+        return None
+    if thinking is not None:
+        if thinking.mode == THINKING_DISABLED:
+            return None
+        if thinking.mode in (THINKING_ADAPTIVE, THINKING_BUDGET):
+            return f"the call asks for {thinking.mode!r} thinking"
+        if thinking.effort is not None and \
+                info.provider != PROVIDER_ANTHROPIC:
+            return ("the call names a reasoning effort, which turns "
+                    "reasoning on for this wire")
+    if support.default_on:
+        return ("thinking is on by default for this model and the call "
+                "does not disable it")
+    return None
+
+
+def _refuse_starving_cap(model, info, thinking, *, max_tokens):
+    """Refuse a cap a thinking call cannot answer within.
+
+    The one refusal in this layer aimed at a request the endpoint would
+    ACCEPT. `max_tokens` caps thinking plus response text together, so a
+    reasoning call under a starving cap spends the cap on reasoning and
+    truncates or empties the answer — a paid call whose failure is silent,
+    and which a sequential caller repeats once per field. Refusing it here
+    turns a whole wasted run into one loud error before any spend.
+
+    The floor is `_THINKING_CAP_FLOOR`, this package's own policy figure
+    (see its comment); the message says whose number it is. A budget-mode
+    spec that STATES its `budget_tokens` is exempt: the caller did its own
+    arithmetic, and `budget_tokens < max_tokens` is already enforced where
+    the budget is validated.
+    """
+    if max_tokens is None:
+        return
+    if thinking is not None and thinking.mode == THINKING_BUDGET \
+            and thinking.budget_tokens is not None:
+        return
+    cause = _reason_the_call_thinks(info, thinking)
+    if cause is None:
+        return
+    if max_tokens < _THINKING_CAP_FLOOR:
+        raise ThinkingUnsupported(
+            f"max_tokens {max_tokens} cannot fit a reasoning call on model "
+            f"{model!r}: {cause}, the cap covers thinking AND response text "
+            f"together, and below {_THINKING_CAP_FLOOR} — direktoro's own "
+            f"floor, not the endpoint's — the response is truncated or "
+            f"empty while still billed. Raise the cap, or disable thinking "
+            f"on the call.")
+
+
 # ---------------------------------------------------------------------------
 # Resolved decoding params (single source of truth)
 # ---------------------------------------------------------------------------
@@ -587,19 +834,29 @@ def resolved_decoding_params(model, *, max_tokens, sampling=None,
                                   nobody established.
       - unspecified, refused   -> absent from both, and nothing to report.
 
-    A `reasoning_effort` quirk is included under the wire's key
-    (`reasoning={"effort": ...}` for Responses, `reasoning_effort` for Chat
-    Completions). It is REGISTRY-SUPPLIED rather than caller-specified (see
-    `Model`), so it is sent on every call to an entry that declares one and
-    folds into identity like anything else sent; editing that quirk moves the
-    fingerprint because it changes what is sent.
+    A specified, accepted value is additionally checked against the model's
+    documented range (`Model.sampling_bands`) and refused with a ValueError
+    when it falls outside — the endpoint would reject it, so it fails here
+    before the call is billed rather than after.
+
+    A `reasoning_effort` quirk is the level in force when the caller
+    specifies nothing, included under the wire's key (`reasoning={"effort":
+    ...}` for Responses, `reasoning_effort` for Chat Completions). A
+    caller-chosen level — a named effort, or "none" carrying a disabled mode —
+    takes its place on the wire and in identity.
 
     `thinking` is an optional per-call `Thinking` spec (mode and/or reasoning
     effort). It defaults to None, which emits nothing and leaves each model's
-    own default thinking behaviour in force. When supplied it is
-    validated against the model's registry `ThinkingSupport` and emitted as the
-    Anthropic wire keys `thinking` / `output_config`; a shape the endpoint would
-    reject raises `ThinkingUnsupported` here, before any spend. Because this
+    own default thinking behaviour in force. When supplied it is validated
+    against the model's registry `ThinkingSupport` and rendered for the
+    model's wire — Anthropic's `thinking` / `output_config` keys, or the
+    single OpenAI-family reasoning level, where disabling rides as "none";
+    a shape the endpoint would reject raises `ThinkingUnsupported` here,
+    before any spend. A call that will think — an explicit on-mode, or a
+    default-on model left undisabled — is also refused when `max_tokens`
+    cannot fit the endpoint's minimum thinking budget plus any answer (see
+    `_refuse_starving_cap`): the endpoint would accept it, and then spend the
+    whole cap on reasoning. Because this
     function is the single source of truth for BOTH the wire request and the
     decoding-params block folded into call identity, a chosen mode or effort
     automatically becomes part of that identity: two runs differing only in
@@ -621,7 +878,7 @@ def resolved_decoding_params(model, *, max_tokens, sampling=None,
     # caller may carry a fixed set of keys and leave the ones it has no opinion
     # on empty.
     asked = dict(sampling or {})
-    unknown = sorted(set(asked) - set(SAMPLING_PARAMS))
+    unknown = sorted(set(asked) - set(SAMPLING_PARAMS), key=str)
     if unknown:
         raise ValueError(
             f"unknown sampling parameter(s) {unknown}; this layer emits "
@@ -630,9 +887,10 @@ def resolved_decoding_params(model, *, max_tokens, sampling=None,
     sending = {name: asked[name] for name in SAMPLING_PARAMS
                if asked.get(name) is not None
                and name not in info.rejects_sampling}
-    effort = quirks.get("reasoning_effort")
+    _refuse_out_of_band_sampling(model, info, sending)
     thinking_params = _thinking_params(
         model, info, thinking, max_tokens=max_tokens)
+    _refuse_starving_cap(model, info, thinking, max_tokens=max_tokens)
 
     if info.provider == PROVIDER_ANTHROPIC:
         dec = {"max_tokens": max_tokens}
@@ -644,6 +902,12 @@ def resolved_decoding_params(model, *, max_tokens, sampling=None,
         dec.update(sending)
         dec.update(thinking_params)
         return dec
+
+    # The `reasoning_effort` quirk is the level in force when the caller says
+    # nothing; a level the caller chose (a named effort, or "none" for a
+    # disabled mode) takes its place on the wire and in identity.
+    effort = thinking_params.get("reasoning_effort") \
+        or quirks.get("reasoning_effort")
 
     if info.wire_api == WIRE_CHAT_COMPLETIONS:
         dec = {"max_tokens": max_tokens}
@@ -839,11 +1103,10 @@ class OpenAIAdapter:
     def create_message(self, *, model, system, messages, max_tokens,
                        tools=None, tool_choice=None, sampling=None,
                        thinking=None):
-        # `thinking` is accepted so the adapter interface is uniform across
-        # providers, but the seam emits Anthropic wire keys and the OpenAI
-        # families take reasoning effort from the registry's `reasoning_effort`
-        # quirk, so a non-None spec is refused by the resolver rather than
-        # translated on a guess. See `_thinking_params`.
+        # `thinking` is threaded to the resolver, which renders it for this
+        # wire — a named effort as the single reasoning level, a disabled
+        # mode as "none" — or refuses a shape the entry's declared surface
+        # does not take. See `_openai_family_thinking_params`.
         info = model_info(model)
         canonical = {
             "model": model,
