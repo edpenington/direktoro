@@ -91,13 +91,10 @@ DEFAULT_MAX_TOKENS = 8192
 
 # No default temperature. `--temperature` is omitted unless asked for, exactly
 # like `--thinking`, which leaves each model's own sampling default in force.
-# A default of 0.0 would be a decision this harness has no reason to make and
-# one consequence it cannot escape: on the 4.6-generation and earlier endpoints
-# a temperature and active thinking cannot both be sent (the pair is a 400, so
-# `resolved_decoding_params` refuses it), and those are precisely the entries a
-# `--thinking` run would exercise. With a temperature always present, every such
-# run is refused before it starts and `--thinking-budget` — whose only eligible
-# model is the pre-4.6 Haiku 4.5 — can never be sent at all. Pass
+# Sending one rules out a `--thinking` run on the 4.6-generation and earlier
+# endpoints, where a temperature and active thinking cannot both be sent (the
+# pair is a 400, so `resolved_decoding_params` refuses it) — including the
+# pre-4.6 Haiku 4.5, the only model `--thinking-budget` can name. Pass
 # `--temperature 0.0` to pin it deliberately; a plumbing check that only counts
 # tool calls does not need it pinned.
 DEFAULT_TEMPERATURE = None

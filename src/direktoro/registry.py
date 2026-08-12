@@ -268,13 +268,10 @@ class ThinkingSupport:
 
     A model whose entry leaves `thinking` as None is UNDECLARED, not
     unsupported: the seam refuses any explicit thinking spec for it and says so,
-    rather than guessing a shape. Adding this field is additive for the seam's
-    TRANSLATIONS — nothing declares it except the entries whose behaviour was
-    verified — but declaring `default_on=True` also arms the starving-cap
-    guard (`providers._refuse_starving_cap`), so a spec-less call that
-    resolved before the declaration can be refused after it. That is the
-    point of declaring, and it is said here so nobody reads "additive" as
-    "changes no call's admissibility".
+    rather than guessing a shape. Declaring `default_on=True` also arms the
+    starving-cap guard (`providers._refuse_starving_cap`), which refuses a call
+    carrying no thinking spec at all when its `max_tokens` cannot fit the
+    reasoning the model runs anyway.
     """
 
     modes: tuple = ()
@@ -408,14 +405,11 @@ class Model:
     says when nobody has established otherwise: this field claims refusals, never
     acceptances, so an undeclared param is sent rather than guessed at.
 
-    It is one declaration covering what were two separate shapes of the same
-    fact: a reasoning model that rejects only some controls, and a model whose
-    provider dropped them all. Both are now a set of names, and a new sampling
-    control is a name in that set rather than a new field. Today's values:
-    Opus 4.7+ and Sonnet 5 refuse all three (the Claude model reference lists
-    them as removed for that family); the GPT-5.x reasoning entries refuse
-    `temperature`, which is what their documentation states and the only one
-    established for them; Gemini 3.6 Flash refuses `temperature` and `top_p`,
+    A new sampling control is a name in that set rather than a new field.
+    Today's values: Opus 4.7+ and Sonnet 5 refuse all three (the Claude model
+    reference lists them as removed for that family); the GPT-5.x reasoning
+    entries refuse `temperature`, which is what their documentation states and
+    the only one established for them; Gemini 3.6 Flash refuses all three,
     which is what its Vertex `supported_parameters` omits.
 
     `resolved_decoding_params` omits a refused param, so the omission is honest —
@@ -527,12 +521,11 @@ class Model:
                 "WIRE_CHAT_COMPLETIONS: the OpenRouter provider object, "
                 "pin assertion, and reported-cost capture exist only on "
                 "that path.")
-        # `rejects_sampling` occupies the slot a boolean flag once did, and the
-        # record is reachable positionally, so a value of the wrong shape is
-        # refused at import rather than read as a truthy set of no names. An
-        # unknown name is refused for the opposite reason: it would silently
-        # declare a refusal of something nothing ever sends, which reads as a
-        # documented fact while doing nothing.
+        # The record is reachable positionally, so a `rejects_sampling` value of
+        # the wrong shape is refused at import rather than read as a truthy set
+        # of no names. An unknown name is refused for the opposite reason: it
+        # would silently declare a refusal of something nothing ever sends,
+        # which reads as a documented fact while doing nothing.
         if not isinstance(self.rejects_sampling, (frozenset, set)):
             raise TypeError(
                 f"rejects_sampling must be a set of sampling parameter names "
@@ -1201,8 +1194,8 @@ def rejected_sampling_params(model):
     nobody has established a refusal for: this reports declared refusals, never
     acceptances. Today: Opus 4.7+ and Sonnet 5 refuse all of
     `temperature`/`top_p`/`top_k`; the GPT-5.x reasoning entries refuse
-    `temperature`; google/gemini-3.6-flash refuses `temperature` and `top_p`
-    (its Vertex endpoints list neither in supported_parameters — confirmed live
+    `temperature`; google/gemini-3.6-flash refuses all three (its Vertex
+    endpoints list none of them in supported_parameters — confirmed live
     2026-07-24).
 
     The decoding resolver (`resolved_decoding_params`) consults the field this
@@ -1245,14 +1238,14 @@ def thinking_support(model):
     those; a consumer reads this to size caps deliberately instead of inheriting
     a default it never chose.
 
-    None means the entry has not declared its thinking surface — 10 of the 16
-    entries today: every non-Anthropic entry, plus the three retired ids. It
-    does NOT mean "no
-    thinking": it means direktoro will refuse to emit a thinking shape for that
-    model rather than guess one. Raises ValueError for an unknown id, like
-    `model_info`. Mirrors `supports_forced_tool_choice` /
-    `rejected_sampling_params` (the field lives on the `Model` record too, as
-    `model_info(model).thinking`; this is the named accessor).
+    None means the entry has not declared its thinking surface — six of the 16
+    entries today: the two OpenAI entries, one routed entry, and the three
+    retired ids. It does NOT mean "no thinking": it means direktoro will refuse
+    to emit a thinking shape for that model rather than guess one. Raises
+    ValueError for an unknown id, like `model_info`. Mirrors
+    `supports_forced_tool_choice` / `rejected_sampling_params` (the field lives
+    on the `Model` record too, as `model_info(model).thinking`; this is the
+    named accessor).
     """
     return model_info(model).thinking
 

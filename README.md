@@ -31,7 +31,7 @@ Both SDKs are imported lazily, inside the adapters, so:
 - a run that only calls Anthropic models never needs `openai` present.
 
 CI checks that against a built wheel in an environment with both SDKs genuinely
-absent, rather than leaving it as a claim in this file.
+absent.
 
 ## Install
 
