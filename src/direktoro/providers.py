@@ -368,18 +368,24 @@ def _thinking_params(model, info, thinking, *, max_tokens):
     if thinking is None:
         return {}
 
-    # The thinking parameter and output_config.effort are ANTHROPIC wire keys.
-    # The OpenAI families spell reasoning effort differently and take it from
-    # the per-model `reasoning_effort` quirk today; emitting an Anthropic shape
-    # onto those wires would be a 400 of our own making, so refuse instead.
+    # The thinking parameter and output_config.effort are ANTHROPIC wire keys,
+    # and so is the vocabulary a caller picks from: `EFFORT_LEVELS` carries
+    # Anthropic's ladder, `xhigh` and `max` included. Accepting a spec here for
+    # another family would let a caller name a level that family's endpoint
+    # 400s on. The emission is not the obstacle — `resolved_decoding_params`
+    # already writes `reasoning={"effort": ...}` / `reasoning_effort` on those
+    # wires from the registry quirk — so what this refusal is waiting on is a
+    # per-provider effort vocabulary, not a proof that the wire works.
     if info.provider != PROVIDER_ANTHROPIC:
         raise ThinkingUnsupported(
             f"model {model!r} is served by {info.provider!r}, and the per-call "
-            f"thinking seam emits Anthropic wire keys (`thinking`, "
-            f"`output_config.effort`). Reasoning effort for the OpenAI-family "
-            f"and gateway-routed endpoints comes from the model's "
-            f"`reasoning_effort` quirk in the registry; extending this seam to "
-            f"them needs their accepted effort levels live-verified first.")
+            f"thinking seam takes Anthropic wire keys (`thinking`, "
+            f"`output_config.effort`) and Anthropic's effort ladder. Reasoning "
+            f"effort for the OpenAI-family and gateway-routed endpoints comes "
+            f"from the model's `reasoning_effort` quirk in the registry; "
+            f"making it caller-specifiable needs a per-provider effort "
+            f"vocabulary, so that a level this endpoint rejects cannot be "
+            f"named here.")
 
     support = info.thinking
     if support is None:
