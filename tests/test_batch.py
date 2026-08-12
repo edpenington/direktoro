@@ -29,7 +29,7 @@ from direktoro.batch import (
 from direktoro.providers import (
     AnthropicAdapter, MissingAPIKey, NormalisedResponse,
     resolved_decoding_params)
-from direktoro.registry import PROVIDER_ANTHROPIC
+from direktoro.registry import PROVIDER_ANTHROPIC, SAMPLING_PARAMS
 from direktoro.routing import call_identity_fields, canonical_json
 
 
@@ -396,6 +396,46 @@ def test_the_call_identity_block_is_the_same_for_batch_and_live():
     # And the block is not vacuously equal: an empty one really would differ.
     assert identity(batched) != canonical_json(
         call_identity_fields(_LIVE_MODEL, decoding_params={}))
+
+
+def test_every_sampling_control_reaches_the_decoding_block():
+    # The block's sampling names are DERIVED from SAMPLING_PARAMS, so every
+    # control this layer can send is part of what the batch call was. A name
+    # the block never learned would drop out of call identity silently, which
+    # is the one failure a fingerprint cannot show. The derivation itself is
+    # pinned: hardcoding the same three names back would pass the behaviour
+    # tests right up until SAMPLING_PARAMS grows.
+    assert batch._DECODING_KEYS == (
+        "max_tokens", *SAMPLING_PARAMS, "thinking", "output_config")
+    # And the params come from the resolver, per _batch_params' own contract,
+    # so this shows the batch block equals what a live call would record.
+    resolved = resolved_decoding_params(
+        _LIVE_MODEL, max_tokens=512,
+        sampling={"temperature": 0.0, "top_p": 0.9, "top_k": 40})
+    params = _batch_params()
+    params.update(resolved)
+    responses = run_message_batch(
+        _StubClient(results=[_succeeded("a", _message(model=_LIVE_MODEL))]),
+        [{"custom_id": "a", "params": params}],
+        sleep=lambda *_: None, poll_interval=0)
+
+    assert responses["a"].decoding_params == {
+        "max_tokens": 512, "temperature": 0.0, "top_p": 0.9, "top_k": 40}
+
+
+def test_two_batches_differing_only_in_top_p_are_different_calls():
+    # The consequence that matters: two batches sampled differently must not
+    # fingerprint alike, or a stored result from one is reused for the other.
+    def identity(params):
+        responses = run_message_batch(
+            _StubClient(results=[_succeeded("a", _message(model=_LIVE_MODEL))]),
+            [{"custom_id": "a", "params": params}],
+            sleep=lambda *_: None, poll_interval=0)
+        return canonical_json(call_identity_fields(
+            _LIVE_MODEL, decoding_params=responses["a"].decoding_params))
+
+    assert identity(_batch_params(top_p=0.9)) != \
+        identity(_batch_params(top_p=0.5))
 
 
 def test_per_request_decoding_params_are_not_shared_across_ids():

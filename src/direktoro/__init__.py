@@ -202,10 +202,13 @@ __all__ = [
     # tool_choice? Stated per entry, never defaulted; a consumer arms its
     # auto-degrade retry off a False.
     "supports_forced_tool_choice",
-    # Capability predicate: does the model's endpoint accept the sampling
-    # controls (temperature/top_p)? False for google/gemini-3.6-flash, whose
-    # Vertex endpoints dropped them; resolved_decoding_params omits an
-    # unaccepted sampling param from wire AND fingerprint.
+    # The sampling controls this layer sends (`SAMPLING_PARAMS`), and per model
+    # the set its endpoint REFUSES. `rejected_sampling_params` returns that set,
+    # empty when no refusal is established — it is a set of refusals, not a
+    # predicate of acceptance, so an empty one says nothing was established
+    # rather than that everything is taken. A named control is omitted by
+    # resolved_decoding_params from wire AND fingerprint; an unnamed one is sent
+    # and the endpoint's own answer settles it.
     "SAMPLING_PARAMS",
     "rejected_sampling_params",
     # Capability lookup: the (low, high) range documented for one sampling

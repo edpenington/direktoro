@@ -6,6 +6,7 @@ path against an environment with every provider key cleared. The network guard
 in conftest.py backstops all of it.
 """
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -32,12 +33,31 @@ def _response(blocks, *, usage=None, stop_reason="tool_use"):
 
 
 class _StubAdapter:
+    """A built adapter, stubbed for the live path.
+
+    `create_message` mirrors the real adapters' signature
+    (`AnthropicAdapter.create_message` / `OpenAIAdapter.create_message`)
+    PARAMETER FOR PARAMETER, so a request this harness builds is checked
+    against the shape the adapters actually take: the sampling controls arrive
+    as one `sampling` mapping, and a request that spread them flat — or named
+    anything else no adapter defines — raises TypeError here exactly as it
+    would against a real provider, instead of being quietly accepted by a
+    `**kwargs` stub and failing only on a live, billable run.
+    """
+
     def __init__(self, response):
         self._response = response
         self.requests = []
 
-    def create_message(self, **kwargs):
-        self.requests.append(kwargs)
+    def create_message(self, *, model, system, messages, max_tokens,
+                       tools=None, tool_choice=None, sampling=None,
+                       thinking=None):
+        self.requests.append({
+            "model": model, "system": system, "messages": messages,
+            "max_tokens": max_tokens, "tools": tools,
+            "tool_choice": tool_choice, "sampling": sampling,
+            "thinking": thinking,
+        })
         return self._response
 
 
@@ -177,6 +197,25 @@ class TestBuildRequest:
         assert chat_choice == {
             "type": "function", "function": {"name": cli.TOOL_NAME}}
 
+    def test_sampling_rides_under_the_adapters_own_parameter(self):
+        # `sampling` is the parameter the adapters take; a flat `temperature`
+        # is a keyword none of them defines, so a request carrying one is a
+        # TypeError the moment it is splatted into create_message.
+        request = cli.build_request(
+            "claude-sonnet-4-6", max_tokens=2048,
+            sampling={"temperature": 0.0, "top_p": None})
+        assert request["sampling"] == {"temperature": 0.0}
+        assert "temperature" not in request
+        assert "top_p" not in request
+
+    def test_an_unspecified_control_leaves_no_sampling_key_at_all(self):
+        # Nothing specified is nothing sent: an empty mapping would print in a
+        # dry run as though sampling were being set.
+        request = cli.build_request(
+            "claude-sonnet-4-6", max_tokens=2048,
+            sampling={"temperature": None})
+        assert "sampling" not in request
+
     def test_a_non_forcing_model_degrades_to_auto(self):
         # A model whose endpoint 404s a forced named tool_choice gets
         # tool_choice "auto" instead, so the request routes at all — and the
@@ -206,6 +245,29 @@ class TestDryRun:
     def test_dry_run_needs_no_keys(self, capsys, monkeypatch):
         _clear_provider_keys(monkeypatch)
         assert cli.main(["--dry-run"]) == 0
+
+    def test_the_printed_request_shows_only_the_sampling_the_model_keeps(
+            self, capsys):
+        # The printed request is the canonical request the live path would
+        # hand to create_message, so it cannot carry a control the resolved
+        # params above it dropped. Opus 5 refuses the sampling controls;
+        # Sonnet 4.6 takes them. The request BLOCK is parsed rather than
+        # substring-matched: the resolved-params line also spells the
+        # temperature, so a substring match would pass even if the printed
+        # request stopped carrying sampling at all.
+        assert cli.main(["--models", "claude-opus-5,claude-sonnet-4-6",
+                         "--temperature", "0.0"]) == 0
+        out = capsys.readouterr().out
+        opus, sonnet = out.split("=== anthropic: claude-sonnet-4-6")
+
+        def request_block(section):
+            # The request JSON is the pretty-printed block opening at a
+            # line-initial brace; the resolved-params line above it carries
+            # an inline brace of its own.
+            return json.loads(section[section.index("\n{") + 1:])
+
+        assert "sampling" not in request_block(opus)
+        assert request_block(sonnet)["sampling"] == {"temperature": 0.0}
 
     def test_usage_error_exits_2(self, capsys):
         assert cli.main(["--models", "not-a-model"]) == 2
@@ -287,6 +349,22 @@ class TestLiveRun:
         assert row["ok"] is True
         assert row["answer"] == "Paris"
         assert row["error"] is None and row["violations"] is None
+
+    def test_a_temperature_reaches_the_adapter_as_a_sampling_mapping(
+            self, monkeypatch):
+        # The whole live path with `--temperature`, against a stub whose
+        # signature is the real adapters': the value arrives under `sampling`,
+        # which is the only shape create_message accepts.
+        response = _response(
+            [_tool_use_block(cli.TOOL_NAME, {"answer": "Paris"})])
+        adapter = _StubAdapter(response)
+        monkeypatch.setattr(
+            cli, "build_adapter", lambda model_id: adapter)
+        assert cli.main(["--live", "--models", "claude-sonnet-4-6",
+                         "--temperature", "0.0"]) == 0
+        sent = adapter.requests[0]
+        assert sent["sampling"] == {"temperature": 0.0}
+        assert "temperature" not in sent
 
     def test_a_direct_row_reports_no_cost(self, monkeypatch):
         # A direct provider reports no cost figure and the harness has no rate

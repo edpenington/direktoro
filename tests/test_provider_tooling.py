@@ -99,11 +99,13 @@ class TestRejectedSamplingParamsPredicate:
         assert rejected_sampling_params("gpt-5.6-sol") == frozenset(
             {"temperature"})
 
-    def test_temperature_and_top_p_for_gemini_36(self):
+    def test_the_whole_set_for_gemini_36(self):
+        # One /endpoints supported_parameters read names no sampling control at
+        # all, so the same evidence establishes all three refusals together.
         assert rejected_sampling_params("google/gemini-3.6-flash") == frozenset(
-            {"temperature", "top_p"})
+            SAMPLING_PARAMS)
         assert model_info("google/gemini-3.6-flash").rejects_sampling == \
-            frozenset({"temperature", "top_p"})
+            frozenset({"temperature", "top_p", "top_k"})
 
     def test_unknown_model_raises(self):
         with pytest.raises(ValueError):

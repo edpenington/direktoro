@@ -189,12 +189,18 @@ class NormalisedResponse:
     the blocks — pulling out tool calls, or reading the first block's text —
     works unchanged across providers.
 
-    `raw_request` is the canonical request, for the caller's audit log.
+    `raw_request` is the canonical request as sent, in canonical vocabulary,
+    for the caller's audit log: a sampling control the model refuses is
+    absent here exactly as it is absent from the wire, while a value the wire
+    respells or supplies from the registry (the output cap's wire key, a
+    registry-defaulted reasoning level) appears in `wire_request` and
+    `decoding_params`, the wire-exact records — not here.
     `wire_request` is the provider's actual wire request as sent — on the
-    Anthropic path the two are byte-identical (the canonical format IS that
-    wire), and it is recorded under both names so an audit path reads ONE
-    field whoever served the call. `raw_response` is the provider's response
-    as a plain dict (`wire_log.response_to_dict`), never an SDK object.
+    Anthropic path it is the canonical request byte-for-byte (the canonical
+    format IS that wire), and it is recorded under both names so an audit
+    path reads ONE field whoever served the call. `raw_response` is the
+    provider's response as a plain dict (`wire_log.response_to_dict`), never
+    an SDK object.
     `decoding_params` records the decoding parameters actually sent after
     quirks were applied (for example sampling controls omitted for models
     that refuse them), so a stored record of the call is self-contained.
@@ -666,17 +672,51 @@ def _openai_family_thinking_params(model, info, support, thinking):
 # at all.
 _THINKING_ON_TYPES = ("adaptive", "enabled")
 
+# The window `top_p` is documented to be allowed in on a request that also
+# turns thinking on, inclusive at both ends (Anthropic's thinking
+# documentation, read 2026-08-01, quoted in `_refuse_sampling_with_thinking`).
+_TOP_P_THINKING_WINDOW = (0.95, 1.0)
+
+# The controls the documentation names as incompatible with active thinking on
+# the 4.6-generation-and-earlier endpoints. Stated, not inferred by excluding
+# `top_p` from whatever `sending` happens to carry: a control added to
+# `SAMPLING_PARAMS` later is an unestablished case, and an unestablished case
+# is sent for the endpoint to answer, never refused by elimination.
+_THINKING_INCOMPATIBLE_SAMPLING = ("temperature", "top_k")
+
+
+def _top_p_rides_with_thinking(value):
+    """Whether `value` is inside the documented `top_p`-with-thinking window.
+
+    The documentation says "allowed at values between 0.95 and 1"; this reads
+    that as the closed interval — both endpoints in — which is this layer's
+    reading of the sentence, not a separately established endpoint fact. A
+    non-numeric value is outside the window: it is a numeric range, so a
+    value that cannot be compared against it is not in it, and the refusal
+    that follows names the range the endpoint documents.
+    """
+    low, high = _TOP_P_THINKING_WINDOW
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return low <= value <= high
+
 
 def _refuse_sampling_with_thinking(model, sending, thinking_params):
-    """Refuse sampling controls on a call that also turns thinking on.
+    """Refuse the sampling controls a call that turns thinking on cannot carry.
 
-    Anthropic's thinking documentation (read 2026-08-01): on Fable 5, Mythos 5,
-    Opus 5, Opus 4.8, Opus 4.7 and Sonnet 5 a non-default `temperature` /
-    `top_p` / `top_k` is a 400 on EVERY request — that is their
-    `rejects_sampling` declaration, and those models never reach here with one. "On older
+    Anthropic's thinking documentation (read 2026-08-01): on the families whose
+    entries declare a `rejects_sampling` set — Opus 5, Opus 4.8, Opus 4.7 and
+    Sonnet 5 — a non-default `temperature` / `top_p` / `top_k` is a 400 on
+    EVERY request, and those models never reach here with one. "On older
     models, the restriction applies only while thinking is on: `temperature`
     and `top_k` are incompatible with thinking, and `top_p` is allowed at
     values between 0.95 and 1."
+
+    So on an active-thinking request this refuses `temperature` and `top_k`,
+    and refuses `top_p` only outside `_TOP_P_THINKING_WINDOW`. An in-window
+    `top_p` goes to the wire alongside the thinking block, because that is the
+    pair the endpoint documents as legal and refusing it would refuse a call
+    that works.
 
     That per-CALL interaction is the one shape `ThinkingSupport` cannot express,
     because it is not a property of the model alone: Sonnet 4.6 and Haiku 4.5
@@ -708,16 +748,32 @@ def _refuse_sampling_with_thinking(model, sending, thinking_params):
     block = thinking_params.get("thinking")
     if not block or block.get("type") not in _THINKING_ON_TYPES:
         return
-    named = ", ".join(f"`{k}`" for k in sorted(sending))
-    raise ThinkingUnsupported(
-        f"model {model!r} accepts {named}, but not on a request that "
-        f"also turns thinking on ({block['type']!r}): on the 4.6-generation "
-        f"and earlier endpoints the sampling controls are incompatible with "
-        f"active thinking and the pair returns a 400. Choose one — drop the "
-        f"sampling params from this call to think, or ask for "
-        f"Thinking(mode='disabled') / no thinking spec to keep sampling "
-        f"control. (The 4.7+ models settle it the other way: they refuse the "
-        f"sampling controls outright, so this layer already omits them.)")
+    low, high = _TOP_P_THINKING_WINDOW
+    incompatible = sorted(name for name in sending
+                          if name in _THINKING_INCOMPATIBLE_SAMPLING)
+    if incompatible:
+        named = ", ".join(f"`{k}`" for k in incompatible)
+        raise ThinkingUnsupported(
+            f"model {model!r} accepts {named}, but not on a request that "
+            f"also turns thinking on ({block['type']!r}): on the "
+            f"4.6-generation and earlier endpoints `temperature` and `top_k` "
+            f"are incompatible with active thinking and the pair returns a "
+            f"400. Choose one — drop the sampling params from this call to "
+            f"think, or ask for Thinking(mode='disabled') / no thinking spec "
+            f"to keep sampling control. (`top_p` is the one control that "
+            f"rides alongside thinking here, at {low} to {high}. The 4.7+ "
+            f"models settle it the other way: they refuse the sampling "
+            f"controls outright, so this layer already omits them.)")
+    top_p = sending.get("top_p")
+    if top_p is not None and not _top_p_rides_with_thinking(top_p):
+        raise ThinkingUnsupported(
+            f"top_p={top_p!r} cannot be sent to model {model!r} on a request "
+            f"that also turns thinking on ({block['type']!r}): the "
+            f"4.6-generation and earlier endpoints allow `top_p` with active "
+            f"thinking only between {low} and {high} inclusive, and return a "
+            f"400 outside that window. Move it into the window, or ask for "
+            f"Thinking(mode='disabled') / no thinking spec to sample as you "
+            f"like.")
 
 
 def _refuse_out_of_band_sampling(model, info, sending):
@@ -937,12 +993,40 @@ def resolved_decoding_params(model, *, max_tokens, sampling=None,
         dec.update(sending)
         return dec
 
-    # OpenAI Responses.
+    # OpenAI Responses. The Responses API has no `top_k` parameter at all, so
+    # a caller's top_k on an entry that does not refuse it cannot be sent —
+    # refused here as a wire fact rather than crashing in the SDK call or
+    # riding to the endpoint as a kwarg nothing reads.
+    if "top_k" in sending:
+        raise ValueError(
+            f"model {model!r} is served on the OpenAI Responses wire, which "
+            f"has no `top_k` parameter; the value cannot be sent. Drop "
+            f"`top_k` from the ask for this model.")
     dec = {"max_output_tokens": max_tokens}
     if effort:
         dec["reasoning"] = {"effort": effort}
     dec.update(sending)
     return dec
+
+
+def _sent_sampling(decoding):
+    """The sampling controls a resolved decoding block actually sends.
+
+    Only the output cap and the reasoning level are respelled per wire; a
+    sampling control that reaches a wire does so under its `SAMPLING_PARAMS`
+    name (a control a wire cannot spell at all — `top_k` on Responses — is
+    refused by the resolver, never resolved), so the subset is read by name
+    and needs no translation. This is what the canonical request's SAMPLING
+    records: a control the model refuses is absent from `raw_request` exactly
+    as it is absent from the wire and from `decoding_params`. Recording the
+    caller's raw ask instead would make one audit field disagree with the
+    other two on the one question they exist to answer. (`raw_request` stays
+    canonical-vocabulary throughout — a registry-defaulted reasoning level or
+    an Anthropic thinking block appears in `wire_request` and
+    `decoding_params`, the wire-exact records, not here.)
+    """
+    return {name: decoding[name] for name in SAMPLING_PARAMS
+            if name in decoding}
 
 
 # ---------------------------------------------------------------------------
@@ -1140,14 +1224,13 @@ class OpenAIAdapter:
             canonical["tools"] = tools
         if tool_choice is not None:
             canonical["tool_choice"] = tool_choice
-        canonical.update({k: v for k, v in (sampling or {}).items()
-                         if v is not None})
 
         if info.wire_api == WIRE_CHAT_COMPLETIONS:
             wire, decoding = _to_chat_completions_wire(
                 model=model, system=system, messages=messages, tools=tools,
                 tool_choice=tool_choice, max_tokens=max_tokens,
                 sampling=sampling, thinking=thinking)
+            canonical.update(_sent_sampling(decoding))
             route = info.route
             if route is not None:
                 # Gateway-served: emit OpenRouter's provider routing object and
@@ -1176,6 +1259,7 @@ class OpenAIAdapter:
             model=model, system=system, messages=messages, tools=tools,
             tool_choice=tool_choice, max_tokens=max_tokens,
             sampling=sampling, thinking=thinking)
+        canonical.update(_sent_sampling(decoding))
 
         try:
             response = self._client.responses.create(**wire)

@@ -358,7 +358,7 @@ class TestSamplingBands:
     def test_every_routed_entry_is_accounted_for(self):
         # The band on a routed entry is OpenRouter's own documented request
         # range, not an upstream fact a probe could establish — and gemini,
-        # which refuses temperature and top_p outright, deliberately carries
+        # which refuses every sampling control outright, deliberately carries
         # none. Derived from the table so a new routed entry must take a
         # position here.
         for model_id, info in MODEL_REGISTRY.items():
@@ -451,7 +451,10 @@ class TestSamplingBands:
 
     def test_a_param_with_no_band_passes_through(self):
         # No range is published for Anthropic's top_k, so nothing is refused;
-        # the endpoint's own answer settles it.
+        # the endpoint's own answer settles it. (`top_p` likewise has no BAND
+        # -- its with-thinking window is a property of the pair, guarded where
+        # thinking is resolved, and `sampling_band` deliberately says nothing
+        # about it.)
         dec = resolved_decoding_params(
             "claude-sonnet-4-6", sampling={"top_k": 99999}, max_tokens=4096)
         assert dec["top_k"] == 99999
@@ -633,8 +636,13 @@ class TestSonnet5Entry:
         assert "temperature" not in dec
 
     def test_sonnet_4_6_still_takes_temperature(self):
-        assert model_info("claude-sonnet-4-6").quirks.get(
-            "no_temperature") is not True
+        # The neighbouring generation declares no refusal, so the resolver
+        # sends what it is given — asserted through the effect, since the flag
+        # alone would not prove the temperature reaches the wire.
+        assert model_info("claude-sonnet-4-6").rejects_sampling == frozenset()
+        dec = resolved_decoding_params(
+            "claude-sonnet-4-6", sampling={"temperature": 0.0}, max_tokens=4096)
+        assert dec["temperature"] == 0.0
 
 
 class TestOpus5Entry:
@@ -754,10 +762,11 @@ class TestRoutedFrontierEntries:
         assert info.route.quantizations == ()
         # Forced named tool_choice verified live at the flex endpoint 2026-07-24.
         assert info.forced_tool_choice is True
-        # 3.6's Vertex endpoints list neither temperature nor top_p (Google
-        # dropped sampling controls on 3.6, live 2026-07-24). top_k is not
-        # named: its absence from that list was never established.
-        assert info.rejects_sampling == frozenset({"temperature", "top_p"})
+        # 3.6's Vertex endpoints list no sampling control at all — temperature,
+        # top_p and top_k are equally absent from the supported_parameters read
+        # of 2026-07-24 — so the entry names all three.
+        assert info.rejects_sampling == frozenset(
+            {"temperature", "top_p", "top_k"})
 
     def test_gemini_resolver_drops_temperature_mimo_keeps_it(self):
         # The resolution seam: resolved_decoding_params (the single source of

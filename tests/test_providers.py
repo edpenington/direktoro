@@ -250,6 +250,35 @@ class TestOpenAIAdapterRoundTrip:
         assert resp.wire_request["model"] == "gpt-5.6-sol"
         assert resp.decoding_params["reasoning"] == {"effort": "medium"}
 
+    def test_a_refused_control_is_absent_from_every_recorded_request(self):
+        # `raw_request` is the canonical request AS SENT, so a control the model
+        # refuses is missing from it exactly as it is missing from the wire and
+        # from decoding_params. Recording the caller's raw ask instead would
+        # leave one audit field claiming a temperature was set on a call that
+        # never carried one.
+        raw = {
+            "model": "gpt-5.6-sol-2026",
+            "status": "completed",
+            "output": [{"type": "function_call", "call_id": "c1",
+                        "name": "record_answer", "arguments": "{}"}],
+            "usage": {"input_tokens": 10, "output_tokens": 2},
+        }
+        sink = {}
+        adapter = OpenAIAdapter(
+            _FakeOpenAIClient(raw, sink), provider="openai",
+            base_url=OPENAI_BASE_URL)
+        resp = adapter.create_message(
+            model="gpt-5.6-sol",
+            system=[{"type": "text", "text": "SYS"}],
+            messages=[{"role": "user",
+                       "content": [{"type": "text", "text": "hi"}]}],
+            max_tokens=4096, sampling={"temperature": 0.0})
+
+        assert "temperature" not in resp.raw_request
+        assert "temperature" not in resp.wire_request
+        assert "temperature" not in resp.decoding_params
+        assert "temperature" not in sink["wire"]
+
 
 # ---------------------------------------------------------------------------
 # Chat Completions request translation (GLM via Z.ai's OpenAI-compat endpoint)
@@ -296,16 +325,19 @@ class TestChatCompletionsRequestTranslation:
         assert "reasoning_effort" not in wire
         assert decoding == {"max_tokens": 4096, "temperature": 0.0}
 
-    def test_gemini_36_omits_temperature_from_wire_and_decoding(self):
-        # google/gemini-3.6-flash sets rejected_sampling_params=False (its Vertex
-        # endpoints list no temperature/top_p), so even though a temperature is
-        # passed, it is absent from the wire request AND from the recorded
-        # decoding params (honest omission — the same dict feeds the fingerprint).
+    def test_gemini_36_omits_sampling_from_wire_and_decoding(self):
+        # google/gemini-3.6-flash names every sampling control in
+        # `rejects_sampling` (its Vertex endpoints list none of them), so a call
+        # that specifies them sends none: they are absent from the wire request
+        # AND from the recorded decoding params (honest omission — the same dict
+        # feeds the fingerprint).
         wire, decoding = _to_chat_completions_wire(
             model="google/gemini-3.6-flash", system="S", messages=[], tools=None,
-            tool_choice=None, max_tokens=4096, sampling={"temperature": 0.0})
-        assert "temperature" not in wire
-        assert "temperature" not in decoding
+            tool_choice=None, max_tokens=4096,
+            sampling={"temperature": 0.0, "top_p": 0.9, "top_k": 40})
+        for name in ("temperature", "top_p", "top_k"):
+            assert name not in wire, name
+            assert name not in decoding, name
         assert decoding == {"max_tokens": 4096}
 
     def test_tool_use_and_result_round_trip_through_messages(self):
@@ -452,6 +484,9 @@ class TestRoutedChatAdapter:
         assert resp.served_provider == "Z.AI"
         assert resp.generation_id == "gen-test-123"
         assert resp.reported_cost == pytest.approx(0.00042)
+        # And a control this model DOES take is recorded on the canonical
+        # request: `raw_request` is what was sent, not a blanket omission.
+        assert resp.raw_request["temperature"] == 0.0
 
     def test_uncached_usage_full_price(self):
         sink = {}

@@ -60,7 +60,7 @@ supports_forced_tool_choice("claude-opus-5")   # True
 thinking_support("claude-opus-5").default_on   # True — it thinks unless told not to
 
 resolved_decoding_params(
-    "claude-opus-5", temperature=0.0, max_tokens=8192,
+    "claude-opus-5", sampling={"temperature": 0.0}, max_tokens=8192,
     thinking=Thinking(mode="adaptive", effort="high"))
 # {'max_tokens': 8192, 'output_config': {'effort': 'high'}, 'thinking': {'type': 'adaptive'}}
 ```
@@ -77,7 +77,7 @@ with:
 from direktoro import ThinkingUnsupported
 
 resolved_decoding_params(
-    "claude-opus-5", temperature=None, max_tokens=8192,
+    "claude-opus-5", sampling={"temperature": 0.0}, max_tokens=8192,
     thinking=Thinking(mode="disabled", effort="max"))
 # ThinkingUnsupported: model 'claude-opus-5' accepts `thinking={'type': 'disabled'}`
 # only at effort 'high' or below, and this call is at 'max'. The pair returns a

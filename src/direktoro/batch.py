@@ -48,7 +48,7 @@ from __future__ import annotations
 import time as _time
 
 from direktoro.providers import MissingAPIKey, NormalisedResponse, NormalisedUsage
-from direktoro.registry import PROVIDER_ANTHROPIC
+from direktoro.registry import PROVIDER_ANTHROPIC, SAMPLING_PARAMS
 from direktoro.wire_log import response_to_dict
 
 # Default gap between batch-status polls, in seconds. Batches usually finish
@@ -183,9 +183,12 @@ def normalise_batch_message(message, *, raw_request=None, decoding_params=None):
 
 # The Anthropic request keys that `providers.resolved_decoding_params` emits,
 # and therefore the ones that make up a response's `decoding_params` on this
-# provider: the output cap, the sampling control when the model accepts one, and
-# the thinking / effort pair when a call asks for them.
-_DECODING_KEYS = ("max_tokens", "temperature", "thinking", "output_config")
+# provider: the output cap, the sampling controls the model accepts, and the
+# thinking / effort pair when a call asks for them. The sampling names are
+# DERIVED from `registry.SAMPLING_PARAMS` — the one list of the controls this
+# layer sends — so a control added there is carried into batch call identity
+# too, rather than dropped from it by a name this tuple never learned.
+_DECODING_KEYS = ("max_tokens", *SAMPLING_PARAMS, "thinking", "output_config")
 
 
 def _submitted_decoding_params(params):

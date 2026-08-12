@@ -794,7 +794,7 @@ MODEL_REGISTRY = {
         rejects_sampling=_NO_SAMPLING, thinking=_THINK_OPUS_4_7),
     # Sonnet 5. Context 1M, max output 128K. Dateless 4.6-generation id, i.e. a
     # pinned snapshot (see the snapshot note above), so it is citation-grade as
-    # written. Rejects the temperature parameter like the Opus 4.7+ family (the
+    # written. Rejects all three sampling controls like the Opus 4.7+ family (the
     # Claude model reference lists Sonnet 5's temperature/top_p/top_k as
     # removed -> 400), so it carries _NO_SAMPLING; supports images (default).
     # THINKING: adaptive runs when the param is omitted (Sonnet 4.6 does not),
@@ -1030,10 +1030,10 @@ MODEL_REGISTRY = {
     # NO SAMPLING PARAMS: the 3.6 Vertex
     # endpoints' supported_parameters list include_reasoning, max_tokens,
     # reasoning, reasoning_effort, response_format, seed, stop,
-    # structured_outputs, tool_choice, tools — but NEITHER temperature NOR top_p
-    # (Google dropped sampling controls on 3.6), so this entry names both in
-    # rejects_sampling and resolved_decoding_params omits them from both wire
-    # and fingerprint.
+    # structured_outputs, tool_choice, tools — and NONE of temperature, top_p or
+    # top_k (Google dropped sampling controls on 3.6), so this entry names all
+    # three in rejects_sampling and resolved_decoding_params omits them from
+    # both wire and fingerprint.
     # LIVE PROBES (2026-07-24): the full pin
     # (order=["google-vertex/global/flex"], allow_fallbacks False, require_
     # parameters True, data_collection deny, zdr True) PLUS temperature:0.0 ->
@@ -1059,11 +1059,12 @@ MODEL_REGISTRY = {
         wire_api=WIRE_CHAT_COMPLETIONS, supports_images=True,
         # Forced named tool_choice verified live at the flex endpoint 2026-07-24.
         forced_tool_choice=True,
-        # The 3.6 Vertex endpoints list no temperature / top_p (Google dropped
-        # sampling controls on 3.6, live 2026-07-24): omit them honestly from wire
-        # and fingerprint, and let the require_parameters 404 be the loud backstop.
-        # top_k is not named: its absence from that list was not established.
-        rejects_sampling=frozenset({"temperature", "top_p"}),
+        # The 3.6 Vertex endpoints list no sampling control at all — temperature,
+        # top_p and top_k are absent from the same /endpoints supported_parameters
+        # read (live 2026-07-24) transcribed above, which is one enumeration and
+        # settles all three together. Omit them honestly from wire and
+        # fingerprint, and let the require_parameters 404 be the loud backstop.
+        rejects_sampling=frozenset({"temperature", "top_p", "top_k"}),
         thinking=_THINK_GEMINI_FLASH,
         route=Route(gateway=GATEWAY_OPENROUTER,
                     upstream=("google-vertex/global/flex",),

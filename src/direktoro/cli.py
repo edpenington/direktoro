@@ -48,8 +48,8 @@ from direktoro.providers import (
     create_message_with_retry, extract_tool_call, resolved_decoding_params,
     tool_choice_named)
 from direktoro.registry import (
-    EFFORT_LEVELS, MODEL_REGISTRY, PROVIDER_ANTHROPIC, THINKING_MODES,
-    WIRE_RESPONSES, is_retired, model_info)
+    EFFORT_LEVELS, MODEL_REGISTRY, PROVIDER_ANTHROPIC, SAMPLING_PARAMS,
+    THINKING_MODES, WIRE_RESPONSES, is_retired, model_info)
 
 
 # The single forced tool. A plumbing placeholder: one required string field is
@@ -261,11 +261,18 @@ def build_request(model_id, *, max_tokens, sampling=None, thinking=None):
     adapter.create_message. Anthropic-shaped throughout except tool_choice,
     which `tool_choice_named` shapes per wire protocol.
 
+    The sampling controls ride as ONE mapping under `sampling`, because that is
+    the parameter every adapter takes (`create_message(..., sampling={...})`);
+    each control's own name is a keyword no adapter defines, so a request that
+    spread them flat would be a TypeError on every model the moment it was
+    splatted.
+
     An unspecified sampling control and an unspecified `thinking` are each
-    omitted ENTIRELY rather than sent as a null: an absent key is what "leave
-    the model's own default in force" looks like on the wire, and it is also
-    what the printed request should show, since a `"temperature": null` in a
-    dry run reads as a parameter being sent when none is."""
+    omitted ENTIRELY rather than sent as a null, and a sampling mapping left
+    with nothing in it is omitted too: an absent key is what "leave the model's
+    own default in force" looks like on the wire, and it is also what the
+    printed request should show, since a `"temperature": null` in a dry run
+    reads as a parameter being sent when none is."""
     request = {
         "model": model_id,
         "system": [{"type": "text", "text": SYSTEM_TEXT}],
@@ -274,11 +281,29 @@ def build_request(model_id, *, max_tokens, sampling=None, thinking=None):
         "tool_choice": tool_choice_named(model_id, TOOL_NAME),
         "max_tokens": max_tokens,
     }
-    request.update({k: v for k, v in (sampling or {}).items()
-                    if v is not None})
+    specified = {name: value for name, value in (sampling or {}).items()
+                 if value is not None}
+    if specified:
+        request["sampling"] = specified
     if thinking is not None:
         request["thinking"] = thinking
     return request
+
+
+def _sampling_as_resolved(resolved):
+    """The sampling controls the resolver kept, read back off the resolved
+    decoding params.
+
+    The dry run builds its printed request from this rather than from the raw
+    ask, so the request and the resolved params printed above it agree: a
+    control the model refuses is missing from both. The printed request is
+    the CANONICAL request — `create_message` kwargs, sampling nested,
+    thinking as the caller's spec — not the wire; the `resolved decoding
+    params` line above it is the wire-keyed record of what the decoding side
+    of the wire carries.
+    """
+    return {name: resolved[name] for name in SAMPLING_PARAMS
+            if name in resolved}
 
 
 def _jsonable(request):
@@ -313,8 +338,11 @@ def run_dry(models, args):
     """Print each model's provider, wire protocol, resolved decoding params,
     and full canonical request as JSON. No client, no key, no network.
 
-    This is also the free way to see exactly what `--thinking` / `--effort`
-    would put on the wire, and to see the resolver REFUSE a shape a model
+    The `resolved decoding params` line is the wire-keyed record of what
+    `--thinking` / `--effort` / a sampling flag put on the decoding side of
+    the wire (registry defaults included); the request printed under it is
+    the CANONICAL request the live path would hand to `create_message`. The
+    dry run is also the free way to see the resolver REFUSE a shape a model
     would reject — a thinking spec its surface does not take, a sampling
     value outside its documented band, a cap a reasoning call cannot answer
     within. Each refusal is a per-model fact, so it is reported per model and
@@ -341,7 +369,7 @@ def run_dry(models, args):
             continue
         request = build_request(
             model_id, max_tokens=args.max_tokens,
-            sampling=_sampling_from_args(args), thinking=thinking)
+            sampling=_sampling_as_resolved(resolved), thinking=thinking)
         print(f"    resolved decoding params: {json.dumps(resolved)}")
         print(json.dumps(_jsonable(request), indent=2, ensure_ascii=False))
         print()
@@ -517,11 +545,13 @@ def build_arg_parser():
     p.add_argument(
         "--temperature", type=float, default=DEFAULT_TEMPERATURE,
         help="Decoding temperature. Omitted by default, leaving each model's "
-             "own sampling default in force; dropped anyway for models whose "
-             "quirks reject it. Sending one rules out --thinking on the "
-             "models that accept both parameters individually but reject the "
-             "pair (Sonnet 4.6, Haiku 4.5), so leave it off to exercise "
-             "thinking.")
+             "own sampling default in force; dropped from the wire request AND "
+             "from the recorded call identity for a model whose registry entry "
+             "names it in `rejects_sampling`, and refused before any spend when "
+             "it falls outside the band that entry documents. Sending one rules "
+             "out --thinking on the models that accept both parameters "
+             "individually but reject the pair (Sonnet 4.6, Haiku 4.5), so "
+             "leave it off to exercise thinking.")
     p.add_argument(
         "--thinking", choices=THINKING_MODES, default=None,
         help="Thinking mode to request. Omitted by default, which leaves each "

@@ -667,13 +667,15 @@ class TestSamplingParamsAndThinking:
     property of the model alone.
 
     Anthropic's thinking documentation: on the 4.7-generation-and-later models a
-    non-default temperature/top_p/top_k is a 400 on every request (the
-    `no_temperature` quirk handles those). "On older models, the restriction
-    applies only while thinking is on: `temperature` and `top_k` are
-    incompatible with thinking". Sonnet 4.6 and Haiku 4.5 are exactly the two
-    live entries without the quirk, so they accept a temperature — until the
-    same request also asks them to think, at which point resolving the two
-    independently would put a 400-producing pair on the wire."""
+    non-default temperature/top_p/top_k is a 400 on every request (those entries
+    declare it in `rejects_sampling`). "On older models, the restriction applies
+    only while thinking is on: `temperature` and `top_k` are incompatible with
+    thinking, and `top_p` is allowed at values between 0.95 and 1." Sonnet 4.6
+    and Haiku 4.5 are exactly the two live entries that declare no refusal, so
+    they accept a temperature — until the same request also asks them to think,
+    at which point resolving the two independently would put a 400-producing
+    pair on the wire. `top_p` inside its window is the one pair the
+    documentation allows, and it goes through."""
 
     THINKING_ON = [
         (SONNET_4_6, Thinking(mode=THINKING_ADAPTIVE)),
@@ -738,6 +740,71 @@ class TestSamplingParamsAndThinking:
             return
         pytest.fail(
             f"expected a refusal, got a silently altered request: {dec!r}")
+
+    def test_an_in_window_top_p_rides_alongside_thinking(self):
+        # The documentation allows `top_p` between 0.95 and 1 with thinking on,
+        # so that pair goes to the wire: refusing it would refuse a call the
+        # endpoint serves.
+        dec = resolved_decoding_params(
+            SONNET_4_6, sampling={"top_p": 0.97}, max_tokens=8192,
+            thinking=Thinking(mode=THINKING_ADAPTIVE))
+        assert dec["top_p"] == 0.97
+        assert dec["thinking"] == {"type": "adaptive"}
+
+    def test_the_window_is_inclusive_at_both_ends(self):
+        for value in (0.95, 1.0):
+            dec = resolved_decoding_params(
+                SONNET_4_6, sampling={"top_p": value}, max_tokens=8192,
+                thinking=Thinking(mode=THINKING_ADAPTIVE))
+            assert dec["top_p"] == value
+
+    def test_an_out_of_window_top_p_is_refused_naming_the_window(self):
+        with pytest.raises(ThinkingUnsupported) as excinfo:
+            resolved_decoding_params(
+                SONNET_4_6, sampling={"top_p": 0.5}, max_tokens=8192,
+                thinking=Thinking(mode=THINKING_ADAPTIVE))
+        message = str(excinfo.value)
+        assert "0.95" in message and "1.0" in message
+        assert "top_p" in message
+
+    def test_a_temperature_is_still_refused_beside_an_allowed_top_p(self):
+        # `top_p` being allowed changes nothing for the other two controls.
+        with pytest.raises(ThinkingUnsupported, match="`temperature`"):
+            resolved_decoding_params(
+                SONNET_4_6, sampling={"temperature": 0.0, "top_p": 0.97},
+                max_tokens=8192, thinking=Thinking(mode=THINKING_ADAPTIVE))
+
+    def test_top_p_outside_the_window_is_fine_without_thinking(self):
+        # The window is a property of the PAIR: with thinking off, `top_p` is
+        # whatever the model's own band allows.
+        dec = resolved_decoding_params(
+            SONNET_4_6, sampling={"top_p": 0.5}, max_tokens=8192,
+            thinking=Thinking(mode=THINKING_DISABLED))
+        assert dec["top_p"] == 0.5
+
+    def test_top_k_is_refused_beside_active_thinking(self):
+        # The other named-incompatible control; previously only temperature
+        # exercised that branch.
+        with pytest.raises(ThinkingUnsupported, match="`top_k`"):
+            resolved_decoding_params(
+                SONNET_4_6, sampling={"top_k": 40}, max_tokens=8192,
+                thinking=Thinking(mode=THINKING_ADAPTIVE))
+
+
+class TestResponsesWireHasNoTopK:
+    """The Responses API spells no `top_k` at all, so a caller's top_k on an
+    entry that does not refuse it is a wire fact, refused before the SDK call
+    rather than crashing inside it or riding as a kwarg nothing reads."""
+
+    def test_top_k_is_refused_as_a_wire_fact(self):
+        with pytest.raises(ValueError, match="no `top_k` parameter"):
+            resolved_decoding_params(
+                GPT, sampling={"top_k": 40}, max_tokens=4096)
+
+    def test_the_other_controls_still_flow(self):
+        dec = resolved_decoding_params(
+            GPT, sampling={"top_p": 0.9}, max_tokens=4096)
+        assert dec["top_p"] == 0.9
 
 
 # ---------------------------------------------------------------------------
