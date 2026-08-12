@@ -347,11 +347,18 @@ class Model:
       - `reasoning_effort`: an OpenAI reasoning-effort level ("low" | "medium"
         | "high") the OpenAI adapter passes as `reasoning={"effort": ...}` on
         the Responses wire, or as `reasoning_effort` on the Chat Completions
-        wire. REGISTRY-SUPPLIED, per the split above: the per-call thinking
-        seam emits Anthropic wire keys and refuses the OpenAI families, so
-        reasoning effort reaches those endpoints only from here. Making it
-        caller-specifiable needs their accepted effort levels live-verified
-        first (see HOW A FACT GETS INTO THIS TABLE).
+        wire. REGISTRY-SUPPLIED, per the split above, and the ONLY member of
+        that class — so it is worth saying exactly what keeps it there, since
+        it is not that the wire shape is unproven. That shape is emitted on
+        every call to these entries and works. What is Anthropic-shaped is the
+        CALLER's side: `ThinkingSupport` speaks in `output_config.effort`,
+        `thinking.display` and `budget_tokens`, and `EFFORT_LEVELS` is
+        Anthropic's own ladder, `xhigh` and `max` included. Letting a caller
+        pick a level from that vocabulary would let it name one this endpoint
+        400s on. Making effort caller-specifiable here therefore needs a
+        per-provider effort vocabulary, plus each entry's accepted levels from
+        its vendor's reference or a probe (see HOW A FACT GETS INTO THIS
+        TABLE) — a larger change than opening the gate.
 
     `wire_api` selects the OpenAI-family wire protocol (`WIRE_RESPONSES` or
     `WIRE_CHAT_COMPLETIONS`); it is read only by the OpenAI adapter and ignored
