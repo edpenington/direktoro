@@ -138,7 +138,7 @@ jobs:
           assert cost_from_rates(rates={"input": 5.0},
                                  input_tokens=1_000_000) == 5.0
           assert resolved_decoding_params(
-              "claude-opus-5", temperature=None, max_tokens=8192,
+              "claude-opus-5", sampling=None, max_tokens=8192,
               thinking=Thinking(mode="adaptive", effort="high"))["thinking"] \
               == {"type": "adaptive"}
           print("ok", direktoro.__version__)
