@@ -25,6 +25,27 @@ from direktoro.registry import (
     rejected_sampling_params, supports_forced_tool_choice)
 
 
+def _fake_sdk(monkeypatch, module_name, class_name):
+    """Stand a fake provider SDK module in `sys.modules` and return the dict its
+    client constructor records its kwargs into.
+
+    `build_adapter` imports the SDK lazily, inside the build-the-client path, so
+    replacing the module is enough to capture exactly what the constructor is
+    called with — hermetically, whether or not the real SDK is installed, and
+    with no client ever built. An empty dict afterwards means no constructor
+    ran."""
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    fake = types.ModuleType(module_name)
+    setattr(fake, class_name, FakeClient)
+    monkeypatch.setitem(sys.modules, module_name, fake)
+    return captured
+
+
 class TestToolChoiceNamed:
     def test_anthropic_shape(self):
         assert tool_choice_named("claude-haiku-4-5-20251001", "record_answer") \
@@ -226,55 +247,57 @@ class TestBuildAdapter:
         # max_retries forwards to the SDK constructor on the build-the-client
         # path. A fake `anthropic` module captures the kwargs, so the test is
         # hermetic and works whether or not the real SDK is installed.
-        captured = {}
-
-        class FakeAnthropic:
-            def __init__(self, **kwargs):
-                captured.update(kwargs)
-
-        fake = types.ModuleType("anthropic")
-        fake.Anthropic = FakeAnthropic
-        monkeypatch.setitem(sys.modules, "anthropic", fake)
+        captured = _fake_sdk(monkeypatch, "anthropic", "Anthropic")
 
         adapter = build_adapter(
             "claude-haiku-4-5-20251001",
-            env={"ANTHROPIC_API_KEY": "sk-test"}, max_retries=0)
+            env={"ANTHROPIC_API_KEY": "sk-test"}, max_retries=3)
         assert isinstance(adapter, AnthropicAdapter)
         assert captured["api_key"] == "sk-test"
-        assert captured["max_retries"] == 0
+        # A named value is honoured as named: this is how a caller hands retry
+        # back to the SDK on purpose.
+        assert captured["max_retries"] == 3
 
     def test_max_retries_reaches_openai_client(self, monkeypatch):
-        captured = {}
-
-        class FakeOpenAI:
-            def __init__(self, **kwargs):
-                captured.update(kwargs)
-
-        fake = types.ModuleType("openai")
-        fake.OpenAI = FakeOpenAI
-        monkeypatch.setitem(sys.modules, "openai", fake)
+        captured = _fake_sdk(monkeypatch, "openai", "OpenAI")
 
         info = model_info("z-ai/glm-4.6v")
         adapter = build_adapter(
             "z-ai/glm-4.6v",
-            env={"OPENROUTER_API_KEY": "sk-or"}, max_retries=0)
+            env={"OPENROUTER_API_KEY": "sk-or"}, max_retries=3)
         assert isinstance(adapter, OpenAIAdapter)
         assert captured["api_key"] == "sk-or"
         assert captured["base_url"] == info.base_url
-        assert captured["max_retries"] == 0
+        assert captured["max_retries"] == 3
 
-    def test_no_max_retries_leaves_sdk_default_untouched(self, monkeypatch):
-        # Default path forwards NO max_retries kwarg, so the SDK default stands.
-        captured = {}
-
-        class FakeAnthropic:
-            def __init__(self, **kwargs):
-                captured.update(kwargs)
-
-        fake = types.ModuleType("anthropic")
-        fake.Anthropic = FakeAnthropic
-        monkeypatch.setitem(sys.modules, "anthropic", fake)
+    def test_a_constructed_anthropic_client_disables_sdk_retry(
+            self, monkeypatch):
+        # THE DEFAULT IS 0, not the SDK's own default of 2. Both SDKs retry a
+        # request TIMEOUT, which is the one failure this layer's translators
+        # refuse to retry (a timed-out request may already have been served and
+        # billed), so an SDK default left standing pays for one answer up to
+        # three times underneath a caller that asked for no retry at all.
+        captured = _fake_sdk(monkeypatch, "anthropic", "Anthropic")
 
         build_adapter(
             "claude-haiku-4-5-20251001", env={"ANTHROPIC_API_KEY": "sk-test"})
-        assert "max_retries" not in captured
+        assert captured["max_retries"] == 0
+
+    def test_a_constructed_openai_client_disables_sdk_retry(self, monkeypatch):
+        # The same rule on the other SDK: openai's client defaults to 2 retries
+        # and retries APITimeoutError too.
+        captured = _fake_sdk(monkeypatch, "openai", "OpenAI")
+
+        build_adapter("z-ai/glm-4.6v", env={"OPENROUTER_API_KEY": "sk-or"})
+        assert captured["max_retries"] == 0
+
+    def test_an_injected_client_is_wrapped_untouched(self, monkeypatch):
+        # The rule applies to clients this function BUILDS. A caller that hands
+        # one over owns its retry policy — no constructor runs, so nothing here
+        # can (or does) change it.
+        captured = _fake_sdk(monkeypatch, "anthropic", "Anthropic")
+
+        stub = object()
+        adapter = build_adapter("claude-haiku-4-5-20251001", client=stub)
+        assert adapter._client is stub
+        assert captured == {}

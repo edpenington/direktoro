@@ -17,8 +17,11 @@ Usage:
 
 `--dry-run` is the default: it renders and prints each model's canonical
 request and exits without any API call, which proves the request-building for
-every provider for free. A live run needs the explicit `--live` flag AND each
-selected provider's API key exported into the environment. python-dotenv is
+every provider for free. The printed requests go to stdout and a refused model
+goes entirely to stderr, so `direktoro-smoke --dry-run > requests.json` keeps
+the models that produced a request and only those. A live run needs the
+explicit `--live` flag AND each selected provider's API key exported into the
+environment. python-dotenv is
 deliberately not a dependency, so load a .env yourself first:
 
     set -a; source .env; set +a
@@ -49,7 +52,7 @@ from direktoro.providers import (
     tool_choice_named)
 from direktoro.registry import (
     EFFORT_LEVELS, MODEL_REGISTRY, PROVIDER_ANTHROPIC, SAMPLING_PARAMS,
-    THINKING_MODES, WIRE_RESPONSES, is_retired, model_info)
+    THINKING_BUDGET, THINKING_MODES, WIRE_RESPONSES, is_retired, model_info)
 
 
 # The single forced tool. A plumbing placeholder: one required string field is
@@ -194,8 +197,16 @@ def resolve_models(models_arg):
     stop being resolvable and citable. A library consumer applies the same
     predicate at its own equivalent boundary.
 
+    UNSET AND EMPTY ARE DIFFERENT ASKS. Only `--models` never given (None) falls
+    back to the default matrix; a `--models` that was given but names nothing —
+    `--models ""`, or the whitespace an unset shell variable expands to — hits
+    the "named no models" refusal below. The distinction is a spend one on
+    `--live`: treating an empty string as unset silently selects every provider
+    in the default matrix and bills each of them, which is the opposite of what
+    a caller narrowing the run to a variable's contents asked for.
+
     Returns a list of (provider_label, model_id)."""
-    if not models_arg:
+    if models_arg is None:
         return select_default_models()
     resolved = []
     for raw in models_arg.split(","):
@@ -233,10 +244,22 @@ def thinking_from_args(args):
     """The `Thinking` spec the flags ask for, or None when neither was given.
 
     None sends no thinking parameters at all, leaving each model's own default
-    in force — which is what a plumbing check should exercise by default."""
+    in force — which is what a plumbing check should exercise by default.
+
+    `--thinking-budget` sizes a budget that only `--thinking budget` asks for,
+    so the pair is REFUSED here rather than dropped. Every other infeasible
+    combination this program can be given is refused; a budget accepted and
+    ignored would print a request, and report a run, whose reasoning was
+    governed by nothing the caller named."""
     mode = getattr(args, "thinking", None)
     effort = getattr(args, "effort", None)
     budget = getattr(args, "thinking_budget", None)
+    if budget is not None and mode != THINKING_BUDGET:
+        raise ValueError(
+            f"--thinking-budget needs --thinking {THINKING_BUDGET} (got "
+            + (f"--thinking {mode}" if mode else "no --thinking")
+            + "); a budget is the size of the thinking that mode asks for, and "
+            "nothing else sends one.")
     if mode is None and effort is None:
         return None
     return Thinking(mode=mode, effort=effort, budget_tokens=budget)
@@ -344,15 +367,28 @@ def run_dry(models, args):
     value outside its documented band, a cap a reasoning call cannot answer
     within. Each refusal is a per-model fact, so it is reported per model and
     the run continues with a non-zero exit, rather than aborting the whole
-    matrix."""
+    matrix.
+
+    A REFUSED MODEL PRINTS NOTHING TO STDOUT. `direktoro-smoke --dry-run >
+    requests.json` is how the printed requests are kept, so stdout carries the
+    models that produced a request and only those. A refused model's whole
+    per-model block — the `=== label` header, the provider line, and the
+    REFUSED line — goes to stderr together, where a caller reads it. Left on
+    stdout, the header and the provider line would announce in the kept file a
+    model that contributed no request to it, with the reason on a stream that
+    file does not have. Every other refusal this program prints already goes to
+    stderr."""
     thinking = thinking_from_args(args)
     refused = 0
     for label, model_id in models:
         info = model_info(model_id)
-        print(f"=== {label}: {model_id}")
-        print(f"    provider: {info.provider}   "
-              f"wire: {wire_protocol_label(model_id)}   "
-              f"base_url: {info.base_url}")
+        # Composed before the resolver runs and printed after it, because
+        # which STREAM they belong on is decided by whether it refuses this
+        # model.
+        header = f"=== {label}: {model_id}"
+        provider_line = (f"    provider: {info.provider}   "
+                         f"wire: {wire_protocol_label(model_id)}   "
+                         f"base_url: {info.base_url}")
         try:
             resolved = resolved_decoding_params(
                 model_id, sampling=_sampling_from_args(args),
@@ -361,12 +397,16 @@ def run_dry(models, args):
             # ThinkingUnsupported is a ValueError; the band and cap refusals
             # are plain ones. All are per-model config infeasibility.
             refused += 1
-            print(f"    REFUSED: {e}")
-            print()
+            print(header, file=sys.stderr)
+            print(provider_line, file=sys.stderr)
+            print(f"    REFUSED: {e}", file=sys.stderr)
+            print(file=sys.stderr)
             continue
         request = build_request(
             model_id, max_tokens=args.max_tokens,
             sampling=_sampling_as_resolved(resolved), thinking=thinking)
+        print(header)
+        print(provider_line)
         print(f"    resolved decoding params: {json.dumps(resolved)}")
         print(json.dumps(_jsonable(request), indent=2, ensure_ascii=False))
         print()

@@ -34,7 +34,8 @@ from direktoro.providers import (
     create_message_with_retry,
 )
 from direktoro.registry import (
-    OPENAI_BASE_URL, OPENROUTER_BASE_URL, model_info)
+    MODEL_REGISTRY, OPENAI_BASE_URL, OPENROUTER_BASE_URL,
+    WIRE_CHAT_COMPLETIONS, model_info)
 from direktoro.routing import ProviderRouteMismatch
 
 
@@ -340,6 +341,30 @@ class TestChatCompletionsRequestTranslation:
             assert name not in decoding, name
         assert decoding == {"max_tokens": 4096}
 
+    def test_top_k_rides_extra_body_not_a_wire_kwarg(self):
+        # `top_k` is a body field this surface reads but NOT a parameter the
+        # openai SDK's `create` names, so a top-level `top_k=` is a TypeError
+        # before the request leaves. It goes under `extra_body`, the SDK's
+        # channel for body fields it does not name — and stays in `decoding`,
+        # so it is still sent and still identity-bearing.
+        wire, decoding = _to_chat_completions_wire(
+            model="z-ai/glm-4.6v", system="S", messages=[], tools=None,
+            tool_choice=None, max_tokens=4096,
+            sampling={"temperature": 0.0, "top_k": 40})
+        assert "top_k" not in wire
+        assert wire["extra_body"] == {"top_k": 40}
+        assert wire["temperature"] == 0.0      # a named parameter stays put
+        assert decoding == {"max_tokens": 4096, "temperature": 0.0,
+                            "top_k": 40}
+
+    def test_no_top_k_means_no_extra_body_at_all(self):
+        # An empty `extra_body` on a non-routed request would be a body key
+        # nothing asked for.
+        wire, _ = _to_chat_completions_wire(
+            model="z-ai/glm-4.6v", system="S", messages=[], tools=None,
+            tool_choice=None, max_tokens=4096, sampling={"temperature": 0.0})
+        assert "extra_body" not in wire
+
     def test_tool_use_and_result_round_trip_through_messages(self):
         messages = [
             {"role": "user", "content": [
@@ -386,13 +411,39 @@ class TestChatCompletionsRequestTranslation:
 # Chat Completions adapter end-to-end against a fake chat client
 # ---------------------------------------------------------------------------
 
+_UNSENT = object()
+
+
 class _FakeChatCompletions:
+    """`client.chat.completions.create`, stubbed WITH THE REAL SIGNATURE.
+
+    The openai SDK's `create` is keyword-only, names every parameter it takes,
+    and defines no `**kwargs`, so a kwarg it does not name is a TypeError raised
+    in the SDK before any request goes out. A `**kwargs` stub accepts every one
+    of those and reports a happy wire, which makes an unsendable parameter
+    invisible until a live, billable run — so this one names what the adapter
+    can send (the decoding params it resolves for this wire, the tool
+    parameters, and `extra_body`, mirroring `openai.OpenAI().chat.completions
+    .create`) and accepts nothing else.
+
+    `sink["wire"]` records only the parameters actually passed, so a test can
+    assert a control's ABSENCE from the request as well as its value."""
+
     def __init__(self, raw, sink):
         self._raw = raw
         self._sink = sink
 
-    def create(self, **kwargs):
-        self._sink["wire"] = kwargs
+    def create(self, *, model, messages, max_tokens=_UNSENT,
+               temperature=_UNSENT, top_p=_UNSENT, reasoning_effort=_UNSENT,
+               tools=_UNSENT, tool_choice=_UNSENT, extra_body=_UNSENT):
+        passed = {
+            "model": model, "messages": messages, "max_tokens": max_tokens,
+            "temperature": temperature, "top_p": top_p,
+            "reasoning_effort": reasoning_effort, "tools": tools,
+            "tool_choice": tool_choice, "extra_body": extra_body,
+        }
+        self._sink["wire"] = {name: value for name, value in passed.items()
+                              if value is not _UNSENT}
         return SimpleNamespace(model_dump=lambda: self._raw)
 
 
@@ -438,6 +489,46 @@ def _routed_adapter(raw, sink):
     for a routed entry (provider "openrouter", the OpenRouter base URL)."""
     return OpenAIAdapter(_FakeChatClient(raw, sink), provider="openrouter",
                          base_url=OPENROUTER_BASE_URL)
+
+
+class TestTheChatStubMatchesTheInstalledSDK:
+    """The stub above only means anything if its signature is the real one.
+
+    Everything the Chat Completions path is tested against goes through
+    `_FakeChatCompletions.create`, so a stub that accepts more than the SDK does
+    is a seam that hides unsendable parameters until a live run pays for the
+    discovery. These hold it to the SDK that is actually installed — the same
+    check the dependency floors get in tests/test_public_api.py, for the same
+    reason: a claim about the SDK is worth making against the SDK."""
+
+    def _sdk_parameters(self):
+        openai = pytest.importorskip("openai")
+        import inspect
+
+        client = openai.OpenAI(api_key="not-a-real-key")
+        return inspect.signature(client.chat.completions.create).parameters
+
+    def test_the_stub_names_nothing_the_sdk_does_not(self):
+        import inspect
+
+        sdk = self._sdk_parameters()
+        stub = inspect.signature(_FakeChatCompletions.create).parameters
+        extra = [name for name in stub
+                 if name not in ("self",) and name not in sdk]
+        assert extra == [], (
+            f"the stub accepts {extra}, which the installed openai SDK's "
+            f"chat.completions.create does not; a test passing through it "
+            f"proves nothing about what can be sent.")
+
+    def test_the_sdk_takes_no_top_k_but_does_take_extra_body(self):
+        # The wire fact the translation is built on: `top_k` is not a parameter
+        # of this endpoint's method (and it takes no **kwargs, so passing one is
+        # a TypeError), while `extra_body` is the SDK's own channel for body
+        # fields it does not name.
+        sdk = self._sdk_parameters()
+        assert "top_k" not in sdk
+        assert not any(p.kind is p.VAR_KEYWORD for p in sdk.values())
+        assert "extra_body" in sdk
 
 
 class TestRoutedChatAdapter:
@@ -487,6 +578,51 @@ class TestRoutedChatAdapter:
         # And a control this model DOES take is recorded on the canonical
         # request: `raw_request` is what was sent, not a blanket omission.
         assert resp.raw_request["temperature"] == 0.0
+
+    def test_top_k_reaches_the_call_under_extra_body(self):
+        # End to end against the stub whose signature is the SDK's: a routed
+        # model that accepts top_k produces a call carrying it in the request
+        # BODY, beside the routing extras rather than instead of them, and no
+        # `top_k` kwarg — which is the form the SDK would reject.
+        sink = {}
+        adapter = _routed_adapter(
+            _routed_chat_response("z-ai/glm-4.6v", "Z.AI"), sink)
+        resp = adapter.create_message(
+            model="z-ai/glm-4.6v", system="S",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=4096, sampling={"temperature": 0.0, "top_k": 40})
+
+        assert "top_k" not in sink["wire"]
+        extra = sink["wire"]["extra_body"]
+        assert extra["top_k"] == 40
+        # Merged with the routing extras, which still went out intact.
+        assert extra["provider"]["order"] == ["z-ai"]
+        assert extra["usage"] == {"include": True}
+        # Sent means recorded: identity and the canonical request both carry it.
+        assert resp.decoding_params["top_k"] == 40
+        assert resp.raw_request["top_k"] == 40
+        assert resp.wire_request["extra_body"]["top_k"] == 40
+
+    def test_every_routed_model_that_takes_top_k_can_send_it(self):
+        # Asserted over the table rather than one id, so an entry added without
+        # `top_k` in its rejects_sampling is covered on arrival: whatever the
+        # resolver keeps has to be sendable through this adapter, and the stub's
+        # signature is what makes "sendable" mean the SDK's own answer.
+        routed = [model_id for model_id, info in MODEL_REGISTRY.items()
+                  if info.route is not None
+                  and info.wire_api == WIRE_CHAT_COMPLETIONS
+                  and "top_k" not in info.rejects_sampling]
+        assert routed, "no routed entry accepts top_k"
+        for model_id in routed:
+            sink = {}
+            adapter = _routed_adapter(
+                _routed_chat_response(
+                    model_id, model_info(model_id).route.upstream[0]), sink)
+            adapter.create_message(
+                model=model_id, system="S",
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=4096, sampling={"top_k": 40})
+            assert sink["wire"]["extra_body"]["top_k"] == 40, model_id
 
     def test_uncached_usage_full_price(self):
         sink = {}
@@ -733,6 +869,75 @@ class TestRoutedReceiptGuards:
                 model="z-ai/glm-4.6v", system="S",
                 messages=[{"role": "user", "content": "hi"}],
                 max_tokens=4096, sampling={"temperature": 0.0})
+
+
+class TestARefusedRoutedResponseIsStillBilled:
+    """Every routing refusal happens AFTER the gateway served and billed the
+    call, so each carries the response it refuses on `exception.response`.
+
+    The tokens were spent whatever this layer thinks of the receipt. Raising the
+    bare exception discards the only record of that spend, leaving a consumer
+    with a refusal it cannot ledger — so the `NormalisedResponse` as it stood,
+    usage intact and routing fields as far as they got, rides on the
+    exception."""
+
+    def _refusal(self, raw, expected=ProviderError):
+        with pytest.raises(expected) as caught:
+            _routed_adapter(raw, {}).create_message(
+                model="z-ai/glm-4.6v", system="S",
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=4096, sampling={"temperature": 0.0})
+        return caught.value
+
+    def test_a_pin_mismatch_carries_the_billed_response(self):
+        error = self._refusal(
+            _routed_chat_response("z-ai/glm-4.6v", "Novita", cached=200),
+            ProviderRouteMismatch)
+        assert error.response is not None
+        # The spend is readable: full-price input, cache reads, output.
+        assert error.response.usage.input_tokens == 800
+        assert error.response.usage.cache_read_input_tokens == 200
+        assert error.response.usage.output_tokens == 50
+        # Routing fields got no further than the check that failed.
+        assert error.response.served_provider is None
+        assert error.response.generation_id is None
+
+    def test_a_missing_receipt_carries_the_billed_response(self):
+        raw = _routed_chat_response("z-ai/glm-4.6v", "Z.AI")
+        raw["id"] = None
+        error = self._refusal(raw)
+        assert error.response.usage.input_tokens == 1000
+        assert error.response.usage.output_tokens == 50
+        # The pin held before the receipt failed, so that much is on the record.
+        assert error.response.served_provider == "Z.AI"
+
+    def test_a_missing_cost_carries_the_billed_response_and_its_receipt(self):
+        # The most useful of the three: the call is unpriceable from the
+        # gateway's own figure, so the tokens AND the generation id are what a
+        # consumer needs to ledger it (or to look the charge up later).
+        error = self._refusal(
+            _routed_chat_response("z-ai/glm-4.6v", "Z.AI", cost=None))
+        assert error.response.usage.input_tokens == 1000
+        assert error.response.generation_id == "gen-test-123"
+        assert error.response.served_provider == "Z.AI"
+        assert error.response.reported_cost is None
+
+    def test_a_pin_mismatch_is_caught_as_a_provider_failure(self):
+        # ProviderRouteMismatch is a ProviderError, so one `except
+        # ProviderError` around a call catches a broken pin along with every
+        # other provider failure instead of letting it escape unhandled.
+        with pytest.raises(ProviderError):
+            _routed_adapter(
+                _routed_chat_response("z-ai/glm-4.6v", "Novita"), {}
+            ).create_message(
+                model="z-ai/glm-4.6v", system="S",
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=4096, sampling={"temperature": 0.0})
+
+    def test_an_error_with_no_response_carries_none(self):
+        # The attribute is not a promise that there IS billed material: a
+        # failure raised INSTEAD of a response has none, and reads as None.
+        assert ProviderError("nothing was served").response is None
 
 
 # ---------------------------------------------------------------------------

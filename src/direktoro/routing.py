@@ -25,7 +25,10 @@ produces — that function stays the single source of truth for wire-keying, and
 This module performs no network and imports no SDK; the registry lookup it needs
 for `call_identity_fields` is imported lazily inside that function so importing
 `direktoro.routing` never pulls the registry (and so registry entries can hold a
-`Route` without an import cycle).
+`Route` without an import cycle). The one package import it does make is
+`direktoro.errors`, a leaf module holding the base class its refusal shares with
+every other provider failure — importable from here precisely because it imports
+nothing itself.
 """
 
 from __future__ import annotations
@@ -34,6 +37,8 @@ import json
 import re
 from dataclasses import dataclass
 from typing import Optional
+
+from direktoro.errors import ProviderError
 
 
 # The only gateway today. Recorded on every Route for provenance and so a
@@ -83,7 +88,7 @@ class Route:
     zdr: bool = True
 
 
-class ProviderRouteMismatch(RuntimeError):
+class ProviderRouteMismatch(ProviderError):
     """A routed call did not go where its Route declared.
 
     Raised when the served-upstream attribution on a routed response does not
@@ -92,6 +97,19 @@ class ProviderRouteMismatch(RuntimeError):
     loudly rather than ledgering an unverifiable receipt — the same discipline
     that refuses a routed response carrying no cost figure instead of recording
     it as zero.
+
+    A `ProviderError` like every other provider failure, so a caller guarding a
+    call with `except ProviderError` catches a broken pin too rather than having
+    it escape as an unrelated error type.
+
+    THE CALL WAS SERVED AND BILLED: when the adapter raises this, the gateway
+    has already charged for the response being refused. `response` carries that
+    billed material — the `NormalisedResponse` as it stood when the pin failed,
+    its usage intact — so a consumer can record what was spent alongside the
+    refusal instead of losing the figures with the response. It is None when
+    `assert_served_upstream` is called directly on an attribution a caller
+    checked itself, where there is no response to carry (see
+    `direktoro.errors.ProviderError`).
     """
 
 

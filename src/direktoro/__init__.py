@@ -148,7 +148,11 @@ __all__ = [
     "THINKING_DISPLAYS",
     "THINKING_DISPLAY_SUMMARIZED",
     "THINKING_DISPLAY_OMITTED",
-    # Normalised exceptions
+    # Normalised exceptions. `ProviderError` is the root of the whole tree —
+    # rate limits, transient failures and routing refusals alike — so one
+    # `except ProviderError` catches every provider failure this package
+    # raises. On a refusal about a call that WAS served and billed, `.response`
+    # carries the billed response so the spend is still ledgerable.
     "ProviderError",
     "ProviderRateLimitError",
     "ProviderRetryableError",
@@ -233,7 +237,8 @@ __all__ = [
     "WIRE_RESPONSES",
     # Routing & provenance: Route, canonical serialisers for consumer
     # fingerprints, the centralised provider-call identity block, and the
-    # pin-mismatch exception.
+    # pin-mismatch exception — a `ProviderError` like every other provider
+    # failure, carrying the billed response it refuses on `.response`.
     "Route",
     "GATEWAY_OPENROUTER",
     "ProviderRouteMismatch",

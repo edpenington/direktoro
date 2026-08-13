@@ -170,6 +170,34 @@ class TestRetiredGate:
             cli.resolve_models(" , ,")
 
 
+class TestModelsGivenButEmpty:
+    """`--models ""` names no models, and that is not the same ask as omitting
+    the flag.
+
+    Only the unset flag (None) falls back to the default matrix. An empty or
+    whitespace value — what an unset shell variable expands to — is a caller
+    narrowing the run to something that turned out to be nothing, and on
+    `--live` selecting the default matrix instead bills every provider in it."""
+
+    def test_an_empty_string_is_refused_not_defaulted(self):
+        with pytest.raises(ValueError, match="named no models"):
+            cli.resolve_models("")
+
+    def test_whitespace_is_refused_not_defaulted(self):
+        with pytest.raises(ValueError, match="named no models"):
+            cli.resolve_models("   ")
+
+    def test_only_an_omitted_flag_selects_the_default_matrix(self):
+        assert cli.resolve_models(None) == cli.select_default_models()
+
+    def test_the_cli_exits_2_rather_than_running_the_matrix(self, capsys):
+        assert cli.main(["--models", ""]) == 2
+        captured = capsys.readouterr()
+        assert "named no models" in captured.err
+        # And nothing was selected: no model block reached stdout.
+        assert "===" not in captured.out
+
+
 # ---------------------------------------------------------------------------
 # Canonical request
 # ---------------------------------------------------------------------------
@@ -315,7 +343,9 @@ class TestThinkingIsReachableFromTheFlags:
     def test_adaptive_thinking_can_actually_be_sent(self, capsys):
         assert cli.main([
             "--models", self.ADAPTIVE_MODEL, "--thinking", "adaptive"]) == 0
-        assert "REFUSED" not in capsys.readouterr().out
+        captured = capsys.readouterr()
+        assert "REFUSED" not in captured.out
+        assert "REFUSED" not in captured.err
 
     def test_asking_for_both_is_refused_loudly(self, capsys):
         # The refusal is deliberate: a caller that names a
@@ -326,7 +356,79 @@ class TestThinkingIsReachableFromTheFlags:
         assert cli.main([
             "--models", self.ADAPTIVE_MODEL, "--thinking", "adaptive",
             "--temperature", "0.0"]) == 1
-        assert "REFUSED" in capsys.readouterr().out
+        assert "REFUSED" in capsys.readouterr().err
+
+    def test_a_budget_without_budget_mode_is_refused(self, capsys):
+        # The size of a thinking budget only means anything to the mode that
+        # asks for one. Accepting it silently would print a request, and report
+        # a run, governed by nothing the caller named.
+        assert cli.main([
+            "--models", self.BUDGET_MODEL, "--thinking-budget", "2048"]) == 2
+        err = capsys.readouterr().err
+        assert "--thinking-budget needs --thinking budget" in err
+
+    def test_a_budget_beside_the_wrong_mode_is_refused(self, capsys):
+        assert cli.main([
+            "--models", self.ADAPTIVE_MODEL, "--thinking", "adaptive",
+            "--thinking-budget", "2048"]) == 2
+        assert "--thinking-budget needs --thinking budget" \
+            in capsys.readouterr().err
+
+
+class TestDryRunRefusalsGoToStderr:
+    """A dry run's stdout is the printed requests; a refused model is prose
+    about a model, and prose belongs on stderr.
+
+    `direktoro-smoke --dry-run > requests.json` is how the requests are kept,
+    so a refused model contributes NOTHING to that file — not its refusal, and
+    not the header and provider line that would announce a request the file
+    does not contain."""
+
+    REFUSING = "claude-sonnet-4-6"
+    ACCEPTING = "claude-opus-4-8"
+
+    def _both(self, capsys):
+        # Sonnet 4.6 refuses temperature + active thinking; Opus 4.8 takes the
+        # thinking spec, so the run prints one request and refuses one model.
+        assert cli.main([
+            "--models", f"{self.REFUSING},{self.ACCEPTING}",
+            "--thinking", "adaptive", "--temperature", "0.0"]) == 1
+        return capsys.readouterr()
+
+    def test_the_refusal_is_on_stderr_and_not_in_the_requests(self, capsys):
+        captured = self._both(capsys)
+        assert "REFUSED" in captured.err
+        assert "REFUSED" not in captured.out
+        # The surviving model's request is still on stdout, and parses.
+        block = captured.out[captured.out.index("\n{") + 1:]
+        assert json.loads(block)["model"] == self.ACCEPTING
+
+    def test_a_refused_model_leaves_no_orphaned_header_on_stdout(self, capsys):
+        # The header and the provider line are the per-model context of the
+        # refusal. On stdout with the refusal on stderr they announce, in the
+        # kept file, a model with no request under it and no reason anywhere
+        # in it.
+        captured = self._both(capsys)
+        assert self.REFUSING not in captured.out
+        assert captured.out.count("=== ") == 1
+        assert captured.out.count("provider:") == 1
+
+    def test_the_refused_model_keeps_its_whole_context_on_stderr(self, capsys):
+        # And it is not merely absent from stdout: stderr carries the whole
+        # per-model block, in order, so the refusal names the model it is about
+        # and the provider it would have gone to.
+        header, provider_line, refusal = \
+            self._both(capsys).err.strip().splitlines()[:3]
+        assert header.startswith("=== ") and header.endswith(self.REFUSING)
+        assert provider_line.strip().startswith("provider: anthropic")
+        assert refusal.strip().startswith("REFUSED:")
+
+    def test_stdout_is_exactly_the_model_that_produced_a_request(self, capsys):
+        header, provider_line, resolved = \
+            self._both(capsys).out.splitlines()[:3]
+        assert header.startswith("=== ") and header.endswith(self.ACCEPTING)
+        assert provider_line.strip().startswith("provider:")
+        assert resolved.strip().startswith("resolved decoding params:")
 
 
 # ---------------------------------------------------------------------------

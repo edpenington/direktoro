@@ -35,7 +35,9 @@ Adapters do not retry: `create_message` makes one call and, on a provider API
 error, raises a normalised `ProviderError` (or a retryable subclass). A caller
 that wants retry loops around `create_message` and catches the normalised
 exceptions — `create_message_with_retry` is the ready-made loop — and a caller
-that does not lets them propagate.
+that does not lets them propagate. Nothing retries underneath either: a client
+`build_adapter` constructs is built with the SDK's own retry disabled, so the
+retry policy a caller sees is the whole of it.
 """
 
 from __future__ import annotations
@@ -44,27 +46,26 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from direktoro.errors import ProviderError
 from direktoro.registry import (
     EFFORT_LEVELS, PROVIDER_ANTHROPIC, SAMPLING_PARAMS, THINKING_ADAPTIVE,
     THINKING_BUDGET,
     THINKING_DISABLED, THINKING_DISPLAYS, THINKING_MODES,
     WIRE_CHAT_COMPLETIONS, WIRE_RESPONSES, model_info)
-from direktoro.routing import assert_served_upstream, provider_object
+from direktoro.routing import (
+    ProviderRouteMismatch, assert_served_upstream, provider_object)
 from direktoro.wire_log import response_to_dict
 
 
 # ---------------------------------------------------------------------------
 # Normalised exceptions
+#
+# The base is imported from `direktoro.errors`, a leaf module `direktoro.routing`
+# can import too, so `ProviderRouteMismatch` shares this tree without an import
+# cycle (see that module). Importing it here keeps
+# `direktoro.providers.ProviderError` resolving for every consumer that already
+# names it.
 # ---------------------------------------------------------------------------
-
-class ProviderError(Exception):
-    """A provider API error, normalised across SDKs.
-
-    The concrete SDK exception (anthropic.APIError, openai.APIError, ...) is
-    translated into this or a subclass so callers' retry logic is provider
-    independent.
-    """
-
 
 class ProviderRateLimitError(ProviderError):
     """Rate-limited (HTTP 429). Retryable with backoff."""
@@ -1236,11 +1237,14 @@ class OpenAIAdapter:
                 # Gateway-served: emit OpenRouter's provider routing object and
                 # request the response-reported cost. `extra_body` merges these
                 # at the top level of the request body, exactly where OpenRouter
-                # reads them; recorded in `wire` for the audit trail.
-                wire["extra_body"] = {
-                    "provider": provider_object(route),
-                    "usage": {"include": True},
-                }
+                # reads them; recorded in `wire` for the audit trail. MERGED
+                # rather than assigned, because the translation puts body-only
+                # decoding params there too (`top_k`), and assigning would drop
+                # a sampling control the caller asked for while leaving it in
+                # the recorded identity.
+                extra_body = wire.setdefault("extra_body", {})
+                extra_body["provider"] = provider_object(route)
+                extra_body["usage"] = {"include": True}
             try:
                 response = self._client.chat.completions.create(**wire)
             except Exception as exc:
@@ -1331,34 +1335,53 @@ class OpenAIAdapter:
         (`provider`), and response-reported cost (`usage.cost`) off the raw
         completion, RUNS THE PIN ASSERTION (raises `ProviderRouteMismatch` if
         the served upstream is not the pinned one, or is absent) so nothing that
-        did not go where it declared is returned, then threads the three fields
-        onto the NormalisedResponse. `raw` is a plain dict, so this is exercised
-        offline against hand-authored routed-response fixtures.
+        did not go where it declared is returned, and threads each of the three
+        fields onto the NormalisedResponse as it holds. `raw` is a plain dict,
+        so this is exercised offline against hand-authored routed-response
+        fixtures.
+
+        EVERY REFUSAL HERE IS ABOUT A CALL THE GATEWAY ALREADY BILLED, so each
+        one carries the response it refuses on the exception's `response`
+        attribute rather than discarding it: the tokens were spent whatever this
+        layer thinks of the receipt, and a consumer that cannot see them cannot
+        ledger them. Each field is threaded on as soon as it holds, so the
+        attached response carries the provenance established before the refusal
+        — a missing cost still arrives with its generation id and served
+        upstream, which is what a ledger entry for the spend needs.
         """
         served = raw.get("provider")
         # Enforce the pin before returning anything: a mismatch raises here and
-        # the partial response is discarded rather than handed back.
-        assert_served_upstream(route, served)
+        # the response is refused rather than handed back, but it rides on the
+        # exception because it was billed.
+        try:
+            assert_served_upstream(route, served)
+        except ProviderRouteMismatch as mismatch:
+            mismatch.response = normalised
+            raise
+        normalised.served_provider = served
         usage = raw.get("usage") or {}
         generation_id = raw.get("id")
-        reported_cost = usage.get("cost")
         # A routed response without its audit receipt (generation id) or the
         # cost the gateway charged for it is as unrecordable as one served by
         # the wrong upstream: the gateway's figure is the only record of what
         # this call cost, so a silent None would leave the call costless with no
         # receipt. Loud, like the pin.
         if generation_id is None:
-            raise ProviderError(
+            refusal = ProviderError(
                 "routed response carried no generation id ('id'); the call "
                 "cannot be recorded with an audit receipt, so it is refused.")
+            refusal.response = normalised
+            raise refusal
+        normalised.generation_id = generation_id
+        reported_cost = usage.get("cost")
         if reported_cost is None:
-            raise ProviderError(
+            refusal = ProviderError(
                 "routed response carried no usage.cost (was usage:{include:"
                 "true} honoured?); the gateway's own figure is the record of "
                 "what this call was charged, so a costless response is refused "
                 "rather than recorded at $0.")
-        normalised.generation_id = generation_id
-        normalised.served_provider = served
+            refusal.response = normalised
+            raise refusal
         normalised.reported_cost = reported_cost
 
     def _from_wire(self, raw, *, canonical, wire, decoding):
@@ -1590,13 +1613,15 @@ def _to_chat_completions_wire(*, model, system, messages, tools, tool_choice,
     Returns `(wire, decoding)` where `decoding` is the subset of decoding
     params actually sent (from `resolved_decoding_params`, which a caller
     records for provenance and folds into call identity). Its keys
-    (`max_tokens`, `reasoning_effort`, the sampling controls when accepted) are already
-    Chat Completions wire keys, so they merge straight into the wire request.
+    (`max_tokens`, `reasoning_effort`, the sampling controls when accepted) are
+    Chat Completions wire keys, so they merge straight into the wire request —
+    all but `top_k`, which goes under `extra_body` (see below).
     Pure: no network, no SDK, so it is unit-tested directly. The output-token
     cap rides under `max_tokens` (the classic Chat Completions key), which the
     OpenRouter-compatible surface documents, so the newer OpenAI-only
     `max_completion_tokens` is deliberately not used here. The caller adds the
-    OpenRouter provider object under `extra_body` when the model is routed.
+    OpenRouter provider object under `extra_body` when the model is routed,
+    merging with whatever is already there.
     `thinking` is threaded to the resolver only so a spec aimed at a
     non-Anthropic model is refused there rather than silently dropped here.
     """
@@ -1608,6 +1633,18 @@ def _to_chat_completions_wire(*, model, system, messages, tools, tool_choice,
         "messages": _messages_to_chat(system, messages),
         **decoding,
     }
+    # `top_k` is not a Chat Completions PARAMETER: the openai SDK's
+    # `chat.completions.create` names every parameter it takes and defines no
+    # `**kwargs`, so a top-level `top_k=` is a TypeError raised in the SDK
+    # before the request goes anywhere. It IS a body field the OpenRouter
+    # surface reads, and `extra_body` is the SDK's channel for exactly that —
+    # the one the routed provider object and usage flag already ride. So the
+    # value is still sent, and still identity-bearing: `decoding` keeps it
+    # unchanged, so `decoding_params`, the canonical request and the
+    # fingerprint all record it as the sampling control it is. Only its
+    # position in the request moves.
+    if "top_k" in wire:
+        wire.setdefault("extra_body", {})["top_k"] = wire.pop("top_k")
     if tools:
         wire["tools"] = [
             {
@@ -2023,14 +2060,18 @@ def build_adapter(model_id, *, env=None, client=None, max_retries=None):
         for an Anthropic id, an `openai.OpenAI` for an OpenAI-family / routed
         id); this function does not check that.
       - `max_retries`: forwarded to the SDK client constructor when this
-        function builds the client itself (the no-`client` path). Pass
-        `max_retries=0` to disable the SDK's built-in retry, so a caller's own
-        application-level backoff — and the audit trail that goes with it — is
-        the only retry, rather than sitting on top of an invisible second one.
-        None (the default) leaves the SDK default untouched. Passing
-        `max_retries` together with an injected `client` is a loud
-        `ValueError`: the client is already built, so the value could reach no
-        constructor.
+        function builds the client itself (the no-`client` path). A client built
+        here is built with `max_retries=0` UNLESS the caller names a value, so
+        retry policy is owned above, not doubled — the same rule
+        `direktoro.batch.build_batch_client` states for the client it builds.
+        The SDK default is 2, and both SDKs' own retry predicate retries a
+        request TIMEOUT: that is the one failure the error translators here
+        deliberately refuse to retry, because a timed-out request may already
+        have been served and billed while its response was lost, so the SDK
+        default silently pays for one answer up to three times and returns one.
+        Naming a value hands retry back to the SDK on purpose; an injected
+        `client` is untouched, and passing `max_retries` with one is a loud
+        `ValueError` because the value could reach no constructor.
 
     The `anthropic` and `openai` SDKs are imported lazily and ONLY on the
     build-the-client path, so importing this module needs neither, a run that
@@ -2058,9 +2099,11 @@ def build_adapter(model_id, *, env=None, client=None, max_retries=None):
         raise MissingAPIKey(
             f"environment variable {info.api_key_env} is not set; it is needed "
             f"for model {model_id!r}.")
-    # Only forward max_retries when the caller set it, so the SDK default is
-    # untouched by default (an explicit 0 disables the SDK's built-in retry).
-    retry_kwargs = {} if max_retries is None else {"max_retries": max_retries}
+    # A client built here disables the SDK's own retry unless the caller names a
+    # value: this layer's retry policy is `create_message_with_retry` and the
+    # error translation under it, and an SDK retrying beneath that doubles the
+    # loop and hides the attempts from the caller's audit log entirely.
+    retry_kwargs = {"max_retries": 0 if max_retries is None else max_retries}
     if info.provider == PROVIDER_ANTHROPIC:
         import anthropic
         built = anthropic.Anthropic(api_key=api_key, **retry_kwargs)
