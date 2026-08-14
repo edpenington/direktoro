@@ -350,4 +350,5 @@ class TestRoutedWireInvariant:
         with pytest.raises(ValueError, match="WIRE_CHAT_COMPLETIONS"):
             Model("openrouter", "https://openrouter.ai/api/v1",
                   "OPENROUTER_API_KEY", wire_api=WIRE_RESPONSES,
+                  supports_images=True,
                   forced_tool_choice=True, route=_route())

@@ -202,16 +202,24 @@ which table priced it.
 - **Model registry** — 16 entries: eleven direct (Anthropic and OpenAI) and
   five routed through OpenRouter. Each records provider, base URL, key
   environment variable, wire protocol, and capability flags for vision, forced
-  tool choice (stated per entry, never defaulted) and sampling controls,
-  including the documented value range per sampling param where one is
-  published. Ten of the sixteen declare a thinking surface: the six live
-  Anthropic entries from the published reference, and four routed entries from
-  live probes — one of which declares an *empty* surface, an instruct endpoint
-  probed to take no reasoning parameter at all. On the other six the surface is
-  *undeclared*, which means direktoro refuses to emit a thinking shape for them
-  rather than guessing one, not that they cannot think. An unknown id raises
-  and lists what is known, separating the ids that can start a new run from the
-  retired ones that resolve only so past runs stay citable.
+  tool choice and sampling controls, including the documented value range per
+  sampling param where one is published. **Vision and forced tool choice are
+  stated per entry and have no default at all**, because a default there is a
+  capability claim: an entry that says nothing about image input would
+  otherwise report as multi-modal, and a consumer reading it would send image
+  parts and be billed for the rejection. Every entry is vision-capable today,
+  which is a fact about the table rather than something a new entry inherits.
+  Twelve of the sixteen declare a thinking surface: the six live Anthropic
+  entries and both GPT-5.6 entries from the published reference, and four
+  routed entries from live probes — one of which declares an *empty* surface,
+  an instruct endpoint probed to take no reasoning parameter at all. On the
+  other four the surface is *undeclared*, which means direktoro refuses to emit
+  a thinking shape for them rather than guessing one, not that they cannot
+  think: three are retired ids nobody can re-verify, and one is a routed entry
+  whose probe was rate-limited and whose gateway page does not enumerate the
+  levels. An unknown id raises and lists what is known, separating the ids that
+  can start a new run from the retired ones that resolve only so past runs stay
+  citable.
 
 - **Price table** — `direktoro.prices`, a dated reading of the vendors'
   published rates for the direct models: input, output, cached reads and
@@ -299,30 +307,48 @@ is the shape into which a given configuration is rendered.
 ## How the registry stays honest
 
 Every capability flag and quirk carries its evidence, in a comment beside it,
-with the date. There are two kinds of evidence and they are not equally strong,
-so the registry says which is which rather than blurring them:
+with the date.
 
-- **The five routed entries** rest on **live endpoint probes** — the gateway's
-  `/models` and `/endpoints` listings for served upstream, quantization and
-  supported parameters, then a real plain / tool / vision call against the
-  pinned endpoint. These are observations. One narrow exception: a routed
-  entry's sampling band records the gateway's own documented request range,
-  because a continuous range is not a thing a probe can establish.
+**The standard is a clear published statement, not a probe.** If the vendor's or
+the gateway's own reference says a model takes an input, a parameter or a value,
+that is sufficient to record it: write the value, cite the page and the date it
+was read, and move on. Calling an endpoint to watch it accept each parameter is
+not the bar — it costs money and time, and its result goes stale as fast as the
+documentation does. An entry left half-finished because the probing was
+expensive blocks a model that works, which is the more common failure by far.
+When a documented value does turn out to be wrong, the live call is the
+correction: raise it, fix that entry, record what the call did. It is not a
+reason to re-probe everything else.
+
+What a probe is *for* is the case documentation does not settle — a
+gateway-served endpoint whose upstream diverges from the model's own reference,
+a value the reference declines to enumerate, a behaviour nobody wrote down. So
+what the table rests on today is:
+
 - **The eleven direct entries** rest on the vendor's **published model
   reference** — the model and deprecation tables, the migration guide, the
-  thinking documentation, the API reference. These are documentation facts.
-  No Anthropic or OpenAI endpoint was called to watch it accept or reject a
-  parameter.
+  thinking and reasoning documentation, the API reference. No Anthropic or
+  OpenAI endpoint was called to establish any of them, and none needs to be.
+- **The five routed entries** rest mostly on **live endpoint probes** — the
+  gateway's `/models` and `/endpoints` listings for served upstream,
+  quantization and supported parameters, then a real plain / tool / vision call
+  against the pinned endpoint. A pinned upstream's behaviour is exactly what the
+  gateway's model page does not tell you, and two hosts serving one slug can
+  disagree. Where the gateway's own documented request surface settles the
+  question instead (the sampling bands, the effort mapping), the comment says so
+  and no probe was run.
 
 Every value's comment carries the date its evidence was read or probed; the
-dates currently in the table run from 2026-07-23 to 2026-08-12.
+dates currently in the table run from 2026-07-23 to 2026-08-14.
 
-A value left at its field default records nothing at all. `supports_images` is
-the one to know about: the routed entries set it because a probe sent an image,
-while every direct entry takes the default `True`, which stands on the published
-reference like the rest of its row. `forced_tool_choice` has no default at
-all — every entry states it, with its basis beside it — so that reading rule
-cannot arise for it.
+A value left at its field default records nothing at all — so a field whose
+default would read as a *claim* does not get one. Two are in that position and
+neither has a working default: `supports_images` and `forced_tool_choice`. Every
+entry states both, with its basis beside it, and an unstated one is a
+construction error rather than a silent claim. The remaining defaults are honest
+absences: an empty `rejects_sampling` claims no refusal, an empty
+`sampling_bands` claims no range, a `None` thinking surface claims nothing at
+all.
 
 What is still forbidden is copying a flag across because the entry above it sets
 the same one. Families are not uniform — two upstreams serving one slug can

@@ -61,7 +61,7 @@ class TestOpenAIRequestTranslation:
             model="gpt-5.6-sol", system="S", messages=[],
             tools=[{"name": "record_answer", "description": "d",
                     "input_schema": {"type": "object", "properties": {}}}],
-            tool_choice={"type": "auto"}, max_tokens=1000,
+            tool_choice={"type": "auto"}, max_tokens=4096,
             sampling={"temperature": 0.0})
         assert wire["tools"][0] == {
             "type": "function",
@@ -71,20 +71,33 @@ class TestOpenAIRequestTranslation:
             "parameters": {"type": "object", "properties": {}},
         }
         assert wire["tool_choice"] == "auto"
-        assert wire["max_output_tokens"] == 1000
+        assert wire["max_output_tokens"] == 4096
         assert wire["instructions"] == "S"
 
     def test_gpt_omits_temperature_adds_reasoning(self):
-        # max_tokens=100 deliberately: the GPT entries declare no thinking
-        # surface, so the starving-cap guard is inert for them and a small
-        # cap still resolves — this doubles as that pin.
+        # The cap clears _THINKING_CAP_FLOOR deliberately: the GPT entries
+        # declare `default_on=True` (they reason unless told not to, per their
+        # reference), so the starving-cap guard is ARMED for them and a cap
+        # below the floor is refused — see the sibling test below.
         wire, decoding = _to_openai_wire(
             model="gpt-5.6-sol", system="S", messages=[], tools=None,
-            tool_choice=None, max_tokens=100, sampling={"temperature": 0.0})
+            tool_choice=None, max_tokens=4096, sampling={"temperature": 0.0})
         assert "temperature" not in wire
         assert wire["reasoning"] == {"effort": "medium"}
-        assert decoding == {"max_output_tokens": 100,
+        assert decoding == {"max_output_tokens": 4096,
                             "reasoning": {"effort": "medium"}}
+
+    def test_gpt_starving_cap_is_refused_before_the_wire_is_built(self):
+        # The behaviour change that came with declaring the GPT thinking
+        # surface: these models reason on a spec-less call, `max_output_tokens`
+        # caps reasoning plus answer together, so a cap that cannot fit both is
+        # refused here rather than billed and truncated.
+        from direktoro.providers import ThinkingUnsupported
+
+        with pytest.raises(ThinkingUnsupported, match="cannot fit a reasoning"):
+            _to_openai_wire(
+                model="gpt-5.6-sol", system="S", messages=[], tools=None,
+                tool_choice=None, max_tokens=100, sampling=None)
 
     def test_message_blocks_translate_to_input_items(self):
         messages = [

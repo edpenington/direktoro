@@ -58,40 +58,56 @@ a paid call (see `ThinkingSupport`).
 
 HOW A FACT GETS INTO THIS TABLE
 -------------------------------
-Every capability flag and every `quirks` entry rests on one of exactly two kinds
-of evidence, and which kind it is depends on which half of the table the entry
-is in. The distinction matters to anyone citing this file, so it is stated
-rather than blurred:
+THE STANDARD IS A CLEAR PUBLISHED STATEMENT, NOT A PROBE. If the vendor's or the
+gateway's own reference says a model takes an input, a parameter or a value,
+that is sufficient evidence to record it here: write the value, cite the page
+and the date it was read, and move on. Calling an endpoint to watch it accept
+each parameter before it may be written down is NOT the bar and never was —
+it costs real money, it takes real time, and its result goes stale exactly as
+fast as the documentation does. A registry entry nobody has finished because
+the probing was expensive blocks a model that works.
 
-  - DIRECT entries (Anthropic, OpenAI) are read from the vendor's own PUBLISHED
-    MODEL REFERENCE — the model and deprecation tables, the migration guide, the
-    thinking documentation, the API reference — and the comment beside the
-    value names the date that reference was read (the reads currently in the
-    table are from 2026-07-31, 2026-08-01 and 2026-08-12). These are
-    documentation facts. Nothing in this half of the table was established by
-    calling an endpoint and watching it accept or reject a parameter.
-  - ROUTED entries (OpenRouter) are read from LIVE ENDPOINT PROBES: GET
+What a probe is FOR is the case documentation does not settle: a gateway-served
+endpoint whose upstream diverges from the model's own reference, a value the
+reference declines to enumerate, a behaviour nobody has written down. Several
+entries below rest on probes for exactly that reason and their comments say so;
+that record stands as what was observed and is not to be rewritten as though it
+were documentation.
+
+WHEN A DOCUMENTED VALUE TURNS OUT TO BE WRONG the live call is the correction:
+raise it, fix the entry, and record what the call did beside the value it
+replaced. One endpoint contradicting its own reference is a bug in that entry.
+It is not a reason to go back and re-probe everything else.
+
+So the comment beside a value names its evidence — which reference, or which
+probe, and the date — and what the values in this table rest on TODAY is:
+
+  - DIRECT entries (Anthropic, OpenAI) rest on the vendor's PUBLISHED MODEL
+    REFERENCE — the model and deprecation tables, the migration guide, the
+    thinking and reasoning documentation, the API reference. The reads
+    currently in the table are from 2026-07-31, 2026-08-01, 2026-08-12 and
+    2026-08-14. No Anthropic or OpenAI endpoint was called to establish any of
+    them, and none needs to be.
+  - ROUTED entries (OpenRouter) rest mostly on LIVE ENDPOINT PROBES: GET
     /api/v1/models and /endpoints for the served upstream, quantization and
     supported_parameters, then a real plain / tool / vision call against the
-    pinned endpoint. The comment beside the value names what was probed and
-    when. These are the observations in this file; the direct half has none.
-    One narrow exception: a routed entry's `sampling_bands` describe the
-    GATEWAY's own documented request surface — the range OpenRouter itself
-    accepts — because a continuous range is not a thing a probe can establish;
-    the band's comment says so.
+    pinned endpoint. That is not ceremony — a pinned upstream's behaviour is
+    the thing the gateway's model page does not tell you, and two hosts serving
+    one slug can disagree. Where the gateway's OWN documented request surface
+    settles a question instead (`sampling_bands`, the effort/thinkingLevel
+    mapping), the comment says so and no probe was run.
 
-Either way the evidence travels with the value: the comment beside it is the
-evidence, not decoration, so it moves with the value and is rewritten only when
-the value is re-measured or the reference is re-read.
+The evidence travels with the value: it moves with the value and is rewritten
+only when the value is re-measured or the reference is re-read.
 
 A value left at its FIELD DEFAULT is not a record of anything and should not be
-read as one. `supports_images` is the case that matters: the five routed entries
-set it explicitly because a probe actually sent an image, while all eleven
-direct entries simply take the default True, which stands on the published model
-reference like the rest of their row and on no probe at all.
-`forced_tool_choice` closes that gap the other way: it has no working default
-at all, so an unstated value is a construction error rather than a silent
-claim, and every entry carries the flag with its basis beside it.
+read as one, so a field whose default would read as a CLAIM does not get one.
+Two fields are in that position and neither has a working default:
+`supports_images` and `forced_tool_choice`. An unstated value is a construction
+error rather than a silent claim, and every entry carries both flags with the
+basis beside them. The remaining defaults are all honest absences — an empty
+`rejects_sampling` claims no refusal, an empty `sampling_bands` claims no range,
+a None `thinking` claims no surface — which is why they may keep one.
 
 A family constant (`_NO_SAMPLING`, `_EFFORTS_4_7`, `_THINK_OPUS_4_7`, ...) is shared
 between entries because the published reference states the fact per FAMILY, and
@@ -374,14 +390,23 @@ class Model:
     for Anthropic models.
 
     `supports_images` declares whether the model's API accepts image content
-    blocks. It is True for every vision-capable model and False for a text-only
-    endpoint (one that rejects a message whose content carries an image part).
-    A caller reads it via `model_supports_images` to decide whether to send
-    image parts at all, rather than discovering the rejection on a paid call.
-    Every shipped entry is currently vision-capable, and the flag's default is
-    True — so the five routed entries state it because a probe sent an image,
-    while the eleven direct entries inherit it from the published model
-    reference (see HOW A FACT GETS INTO THIS TABLE).
+    blocks. True for a vision-capable model, False for a text-only endpoint
+    (one that rejects a message whose content carries an image part). A caller
+    reads it via `model_supports_images` to decide whether to send image parts
+    at all, rather than discovering the rejection on a paid call.
+
+    The flag has NO default, for the same reason `forced_tool_choice` has
+    none: which inputs an endpoint accepts is part of registering a model, and
+    a default in either direction asserts the unestablished. A default of True
+    is the expensive direction — it makes a text-only entry added by someone
+    who did not think about images report as vision-capable, so a consumer
+    sends image parts and buys the 400 — and it is exactly the reading the
+    FIELD DEFAULT rule forbids. So every entry states the flag with its basis
+    beside the value (see HOW A FACT GETS INTO THIS TABLE); a documented
+    "input modalities: text, image" line in the model's own reference is
+    sufficient basis and is what most of this table rests on. Every shipped
+    entry is vision-capable today, which is a fact about the table, not a
+    default a new entry inherits.
 
     `forced_tool_choice` declares whether the model's endpoint honours a
     FORCED / named / "required" tool_choice (one that names a specific tool the
@@ -485,11 +510,14 @@ class Model:
     without a TypeError: a base URL lands in `api_key_env`, a key env lands in
     `quirks`. Appending is the only edit that cannot do that, and a default is
     what keeps existing constructions positionally valid.
-    `forced_tool_choice` deliberately trades the second half of that away:
-    its None default is a sentinel the constructor refuses, so every
-    construction — registry entry or synthetic — must state the flag. A new
-    field must not repeat that trade without the same grade of justification,
-    because each sentinel breaks every existing downstream construction once.
+    `supports_images` and `forced_tool_choice` deliberately trade the second
+    half of that away: each one's None default is a sentinel the constructor
+    refuses, so every construction — registry entry or synthetic — must state
+    both flags. A new field must not repeat that trade without the same grade
+    of justification, because each sentinel breaks every existing downstream
+    construction once. The grade both meet: the value a default would supply
+    is a capability CLAIM, and getting it wrong costs a billed 400 rather than
+    a local error.
     `tests/test_cost.py::TestModelFieldOrder` pins the order so the rule fails
     loudly rather than being remembered.
     """
@@ -499,10 +527,10 @@ class Model:
     api_key_env: str
     quirks: dict = field(default_factory=dict)
     wire_api: str = WIRE_RESPONSES
-    supports_images: bool = True
-    # None is a sentinel, not a value: construction refuses it in
-    # __post_init__. The field keeps a "default" only so the positional
+    # Both of the next two are SENTINELS, not values: construction refuses
+    # None in __post_init__. Each keeps a "default" only so the positional
     # append-only rule holds (see ADDING A FIELD below).
+    supports_images: Optional[bool] = None
     forced_tool_choice: Optional[bool] = None
     rejects_sampling: frozenset = frozenset()
     retired: bool = False
@@ -536,6 +564,21 @@ class Model:
             raise ValueError(
                 f"rejects_sampling names {unknown}, which are not sampling "
                 f"parameters; it accepts {list(SAMPLING_PARAMS)}.")
+        # Which INPUTS an endpoint accepts is part of registering a model, so
+        # image support is stated rather than defaulted. A default of True
+        # would make a text-only entry added without a thought about images
+        # report as vision-capable, and a consumer reading it would send image
+        # parts and be billed for the rejection — the same paid failure the
+        # forced_tool_choice sentinel below exists to prevent, in the
+        # direction that costs money. A truthy non-bool is refused for that
+        # same reason: the record is reachable positionally.
+        if not isinstance(self.supports_images, bool):
+            raise ValueError(
+                "Model.supports_images must be stated as a bool: True (the "
+                "endpoint accepts image content blocks) or False (text-only). "
+                "There is no default; record the basis — the model "
+                "reference's own input-modality line, or a dated probe — "
+                f"beside the value. Got {self.supports_images!r}.")
         # Whether an endpoint honours a forced tool_choice was either
         # established or it was not, and a default in either direction would
         # assert the unestablished — so there is no working default and every
@@ -679,6 +722,42 @@ _THINK_BUDGET_ONLY = ThinkingSupport(
     modes=(THINKING_BUDGET,), efforts=(), default_on=False,
     displays=_DISPLAYS_BOTH)
 
+# The GPT-5.6 reasoning family (sol, terra). OpenAI's reasoning guide and the
+# per-model reference pages, read 2026-08-14: "Reasoning.effort supports: none,
+# low, medium (default), high, xhigh, and max", stated identically on the sol
+# and terra pages — one documented family fact, recorded once and shared rather
+# than transcribed per row. A PUBLISHED STATEMENT IS THE EVIDENCE HERE and no
+# endpoint was called; that is the standard (see HOW A FACT GETS INTO THIS
+# TABLE), and leaving this undeclared while waiting for a probe was blocking a
+# caller from naming a level on a model that has taken one all along.
+#
+# Mapping onto this package's vocabulary, which is not OpenAI's:
+#   - `efforts` carries the five EFFORT_LEVELS rungs. OpenAI's "none" is not a
+#     rung, it is the off-switch, and `_openai_family_thinking_params` already
+#     renders THINKING_DISABLED as the level "none" — so the off-switch is
+#     declared as a MODE, not as a sixth effort. ("minimal" is documented too
+#     but is likewise not a ladder level, and nothing here emits it — the same
+#     position the Gemini entry records.)
+#   - THINKING_ADAPTIVE is the omitted-state behaviour on this wire (the mode
+#     emits nothing on its own), which is what a reasoning model that reasons
+#     unless told not to actually does.
+#   - `default_on=True` and `default_effort="medium"` are the documented
+#     omitted-state: "If you omit reasoning.effort, GPT-5.6 defaults to medium."
+#     Declaring default_on also arms the starving-cap guard
+#     (`providers._refuse_starving_cap`) for these entries, which is the point
+#     of declaring it — the cap covers reasoning plus answer here as everywhere.
+#   - `displays=()`: `thinking.display` is an Anthropic wire concept with no
+#     rendering on the OpenAI wires, so the seam refuses one rather than
+#     dropping it silently.
+# NOT MODELLED: `reasoning.mode` ("standard" | "pro"), a second GPT-5.6 axis
+# this package has no field for. A caller cannot reach it through the thinking
+# seam and no entry claims it; recording that here is cheaper than someone
+# rediscovering the absence.
+_THINK_GPT_5_6 = ThinkingSupport(
+    modes=(THINKING_ADAPTIVE, THINKING_DISABLED),
+    efforts=("low", "medium", "high", "xhigh", "max"),
+    default_on=True, default_effort="medium")
+
 # ---- Routed-entry thinking surfaces (live probes 2026-08-12) ---------------
 # Probed through the production pins (provider object, require_parameters,
 # zdr / data_collection as declared): one plain call, then one call per
@@ -756,6 +835,19 @@ MODEL_REGISTRY = {
     # new-run gate keeps it unreachable, and the weaker evidence class is the
     # honest price of that combination.
     #
+    # IMAGE INPUT (every LIVE Anthropic entry below): the models overview
+    # states it family-wide rather than per row — "All current Claude models
+    # support text and image input, text output, multilingual capabilities,
+    # and vision" (models overview, read 2026-08-14) — so each live entry
+    # states supports_images=True on that sentence. It covers Opus 5, Opus 4.8,
+    # Opus 4.7, Sonnet 5, Sonnet 4.6 and Haiku 4.5 alike, which is every live
+    # Anthropic id here. The three RETIRED entries state True on the same
+    # weaker basis as their forced_tool_choice above: Claude 3.5 Sonnet,
+    # Sonnet 4 and Opus 4 each documented image input while they were live,
+    # the current overview no longer describes them, and a withdrawn endpoint
+    # cannot be re-read. The flag has no default so it must be stated, and the
+    # new-run gate keeps the value unreachable by anything but provenance.
+    #
     # Opus 5. Context 1M (default and maximum), max output 128K. Rejects
     # temperature/top_p/top_k like the rest of the 4.7+ family (non-default
     # values return 400). THINKING: adaptive is ON when the `thinking` param is
@@ -768,6 +860,7 @@ MODEL_REGISTRY = {
     # verified against the published model and deprecation tables 2026-07-31.
     "claude-opus-5": Model(
         PROVIDER_ANTHROPIC, None, ANTHROPIC_KEY_ENV,
+        supports_images=True,
         forced_tool_choice=True,
         rejects_sampling=_NO_SAMPLING, thinking=_THINK_OPUS_5),
     # Opus 4.8. Context 1M, max output 128K. Adaptive thinking is the only
@@ -775,6 +868,7 @@ MODEL_REGISTRY = {
     # 2026-07-31.
     "claude-opus-4-8": Model(
         PROVIDER_ANTHROPIC, None, ANTHROPIC_KEY_ENV,
+        supports_images=True,
         forced_tool_choice=True,
         rejects_sampling=_NO_SAMPLING, thinking=_THINK_OPUS_4_7),
     # Opus 4.7. Context 1M, max output 128K. Same thinking surface as 4.8 — one
@@ -783,18 +877,20 @@ MODEL_REGISTRY = {
     # from the neighbouring row.
     "claude-opus-4-7": Model(
         PROVIDER_ANTHROPIC, None, ANTHROPIC_KEY_ENV,
+        supports_images=True,
         forced_tool_choice=True,
         rejects_sampling=_NO_SAMPLING, thinking=_THINK_OPUS_4_7),
     # Sonnet 5. Context 1M, max output 128K. Dateless 4.6-generation id, i.e. a
     # pinned snapshot (see the snapshot note above), so it is citation-grade as
     # written. Rejects all three sampling controls like the Opus 4.7+ family (the
     # Claude model reference lists Sonnet 5's temperature/top_p/top_k as
-    # removed -> 400), so it carries _NO_SAMPLING; supports images (default).
+    # removed -> 400), so it carries _NO_SAMPLING.
     # THINKING: adaptive runs when the param is omitted (Sonnet 4.6 does not),
     # `disabled` is accepted at any effort, `budget_tokens` is a 400, and it is
     # the first Sonnet with `xhigh`.
     "claude-sonnet-5": Model(
         PROVIDER_ANTHROPIC, None, ANTHROPIC_KEY_ENV,
+        supports_images=True,
         forced_tool_choice=True,
         rejects_sampling=_NO_SAMPLING, thinking=_THINK_SONNET_5),
     # Sonnet 4.6. Context 1M, max output 128K. Takes sampling params (no
@@ -803,6 +899,7 @@ MODEL_REGISTRY = {
     # effort ladder stops at `max` (no `xhigh` before Opus 4.7).
     "claude-sonnet-4-6": Model(
         PROVIDER_ANTHROPIC, None, ANTHROPIC_KEY_ENV,
+        supports_images=True,
         forced_tool_choice=True,
         thinking=_THINK_SONNET_4_6,
         sampling_bands=_ANTHROPIC_SAMPLING_BANDS),
@@ -813,6 +910,7 @@ MODEL_REGISTRY = {
     # is a repointable pointer (see the module docstring).
     "claude-haiku-4-5-20251001": Model(
         PROVIDER_ANTHROPIC, None, ANTHROPIC_KEY_ENV,
+        supports_images=True,
         forced_tool_choice=True,
         thinking=_THINK_BUDGET_ONLY,
         sampling_bands=_ANTHROPIC_SAMPLING_BANDS),
@@ -832,15 +930,18 @@ MODEL_REGISTRY = {
     # Sonnet 4 (legacy): retired 2026-06-15, replaced by claude-sonnet-5.
     "claude-sonnet-4-20250514": Model(
         PROVIDER_ANTHROPIC, None, ANTHROPIC_KEY_ENV,
+        supports_images=True,
         forced_tool_choice=True, retired=True),
     # Claude 3.5 Sonnet (legacy): retired 2025-10-28, replaced by
     # claude-sonnet-5.
     "claude-3-5-sonnet-20241022": Model(
         PROVIDER_ANTHROPIC, None, ANTHROPIC_KEY_ENV,
+        supports_images=True,
         forced_tool_choice=True, retired=True),
     # Opus 4 (legacy): retired 2026-06-15, replaced by claude-opus-5.
     "claude-opus-4-20250514": Model(
         PROVIDER_ANTHROPIC, None, ANTHROPIC_KEY_ENV,
+        supports_images=True,
         forced_tool_choice=True, retired=True),
 
     # ---- OpenAI (GPT) -------------------------------------------------------
@@ -850,21 +951,35 @@ MODEL_REGISTRY = {
     # these rows. No sampling band is declared: the range of the params these
     # entries still accept was not re-read.
     #
-    # GPT-5.6 flagship. Reasoning model: rejects temperature, defaults to medium
-    # reasoning effort.
+    # IMAGE INPUT (both GPT-5.6 entries): each model's own reference page
+    # states "Input modalities: text, image" (sol and terra pages, read
+    # 2026-08-14), so both state supports_images=True on that line.
+    #
+    # THINKING (both): `_THINK_GPT_5_6`, the documented effort ladder — see
+    # that constant for the reference reads and for how OpenAI's "none" and
+    # "minimal" map onto this package's vocabulary.
+    #
+    # GPT-5.6 flagship. Reasoning model: rejects temperature, reasons by
+    # default at medium effort.
     "gpt-5.6-sol": Model(
         PROVIDER_OPENAI, OPENAI_BASE_URL, OPENAI_KEY_ENV,
         quirks={"reasoning_effort": "medium"},
+        wire_api=WIRE_RESPONSES,
+        supports_images=True,
         forced_tool_choice=True,
         rejects_sampling=_NO_TEMPERATURE,
-        wire_api=WIRE_RESPONSES),
-    # GPT-5.6 mid-tier. Same reasoning-model surface as the flagship.
+        thinking=_THINK_GPT_5_6),
+    # GPT-5.6 mid-tier. Same reasoning-model surface as the flagship: the
+    # reference states the same effort ladder, the same medium default and the
+    # same text+image input for both, which is why they share the constant.
     "gpt-5.6-terra": Model(
         PROVIDER_OPENAI, OPENAI_BASE_URL, OPENAI_KEY_ENV,
         quirks={"reasoning_effort": "medium"},
+        wire_api=WIRE_RESPONSES,
+        supports_images=True,
         forced_tool_choice=True,
         rejects_sampling=_NO_TEMPERATURE,
-        wire_api=WIRE_RESPONSES),
+        thinking=_THINK_GPT_5_6),
 
     # ---- Routed via OpenRouter ---------------------------------------------
     # SAMPLING BANDS (`_OPENROUTER_SURFACE_BANDS`, the routed entries that
@@ -1160,6 +1275,14 @@ def model_supports_images(model):
     rather than assuming, since that is what makes adding a text-only entry
     safe. Raises ValueError for an unknown id, like `model_info`, so a text-only
     degradation is never silently guessed from a missing entry.
+
+    What the True means is worth being precise about, because a consumer may be
+    gating a whole pipeline on it: the flag has NO default, so every entry
+    STATES it with its evidence (see `Model.supports_images`). A True here is
+    therefore a recorded claim about that endpoint, not a value an entry
+    inherited by saying nothing — which is what makes it safe to refuse a run
+    on a False, and what stops a carelessly added text-only entry from
+    reporting as multi-modal.
     """
     return model_info(model).supports_images
 

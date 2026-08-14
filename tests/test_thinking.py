@@ -253,6 +253,7 @@ class TestRefusesShapesTheModelWouldReject:
         monkeypatch.setitem(
             MODEL_REGISTRY, "synthetic-no-display",
             Model("anthropic", None, "ANTHROPIC_API_KEY",
+                  supports_images=True,
                   forced_tool_choice=True,
                   thinking=ThinkingSupport(
                       modes=(THINKING_ADAPTIVE,), efforts=("high",),
@@ -275,6 +276,7 @@ class TestRefusesShapesTheModelWouldReject:
         monkeypatch.setitem(
             MODEL_REGISTRY, "synthetic-omitted-only",
             Model("anthropic", None, "ANTHROPIC_API_KEY",
+                  supports_images=True,
                   forced_tool_choice=True,
                   thinking=ThinkingSupport(
                       modes=(THINKING_ADAPTIVE,), efforts=("high",),
@@ -285,15 +287,16 @@ class TestRefusesShapesTheModelWouldReject:
                 thinking=Thinking(mode=THINKING_ADAPTIVE,
                                   display="summarized"))
 
-    def test_an_undeclared_openai_entry_still_refuses_the_spec(self):
-        # The GPT entries declare no thinking surface (their accepted levels
-        # have not been read from a current reference), so a spec aimed at one
-        # is refused with the fact rather than rendered on a guess; the
-        # registry `reasoning_effort` quirk keeps carrying their omitted-state
-        # default.
+    def test_an_undeclared_routed_entry_still_refuses_the_spec(self):
+        # MiMo declares no thinking surface: its probe was rate-limited
+        # part-way and OpenRouter's model page does not enumerate the levels
+        # either, so nothing establishes the ladder. A spec aimed at it is
+        # refused with that fact rather than rendered on a guess. (The GPT
+        # entries USED to sit here; their levels are documented and are now
+        # declared — see TestOpenAIFamilyRendering.)
         with pytest.raises(ThinkingUnsupported, match="declares no thinking"):
             resolved_decoding_params(
-                GPT, max_tokens=8192,
+                "xiaomi/mimo-v2.5", max_tokens=8192,
                 thinking=Thinking(mode=THINKING_ADAPTIVE))
 
     def test_undeclared_thinking_support_refuses_rather_than_guesses(self):
@@ -405,15 +408,21 @@ class TestOpenAIFamilyRendering:
 
     def test_a_caller_level_replaces_the_registry_default(self):
         # The GPT quirk is the omitted-state default: sent when the caller
-        # says nothing. (A caller cannot yet name a level for GPT — its
-        # surface is undeclared — so the replacement is asserted on identity
-        # shape via the chat wire instead.)
+        # says nothing. Now that the GPT surface is declared from OpenAI's
+        # published ladder, the replacement is asserted where it actually
+        # matters — on the GPT entry itself, on its own Responses wire —
+        # rather than borrowed from the chat-wire GLM entry.
         spec_less = resolved_decoding_params("gpt-5.6-sol", max_tokens=4096)
         assert spec_less["reasoning"] == {"effort": "medium"}
         chosen = resolved_decoding_params(
+            "gpt-5.6-sol", max_tokens=4096,
+            thinking=Thinking(mode=THINKING_ADAPTIVE, effort="low"))
+        assert chosen["reasoning"] == {"effort": "low"}
+        # And the same on the chat wire, where the key is spelled differently.
+        chosen_chat = resolved_decoding_params(
             self.GLM_46V, max_tokens=8192,
             thinking=Thinking(mode=THINKING_ADAPTIVE, effort="low"))
-        assert chosen["reasoning_effort"] == "low"
+        assert chosen_chat["reasoning_effort"] == "low"
 
     def test_effort_reaches_call_identity_on_the_chat_wire(self):
         low = canonical_json(call_identity_fields(
@@ -427,16 +436,18 @@ class TestOpenAIFamilyRendering:
         assert low != high
 
     def test_a_caller_level_replaces_the_quirk_on_one_entry(self, monkeypatch):
-        # The headline claim of the REGISTRY-DEFAULTED split, exercised on a
-        # single synthetic entry carrying BOTH a quirk and a declared surface
-        # (no live entry has both yet): the caller's level rides the wire and
-        # the quirk's does not.
+        # The headline claim of the REGISTRY-DEFAULTED split. The GPT entries
+        # now carry both a quirk and a declared surface and are asserted
+        # directly in `test_a_caller_level_replaces_the_registry_default`;
+        # this synthetic entry keeps the CHAT-wire half of the branch covered
+        # with `default_on=False`, a combination no live entry has.
         from direktoro.registry import MODEL_REGISTRY, Model, ThinkingSupport
         monkeypatch.setitem(
             MODEL_REGISTRY, "synthetic-quirk-and-surface",
             Model("openrouter", "https://openrouter.ai/api/v1",
                   "OPENROUTER_API_KEY", wire_api="chat_completions",
                   quirks={"reasoning_effort": "medium"},
+                  supports_images=True,
                   forced_tool_choice=True,
                   thinking=ThinkingSupport(
                       modes=(THINKING_ADAPTIVE,),
@@ -461,6 +472,7 @@ class TestOpenAIFamilyRendering:
             Model("openrouter", "https://openrouter.ai/api/v1",
                   "OPENROUTER_API_KEY", wire_api="chat_completions",
                   quirks={"reasoning_effort": "medium"},
+                  supports_images=True,
                   forced_tool_choice=True,
                   thinking=ThinkingSupport(
                       modes=(THINKING_ADAPTIVE,),
@@ -480,13 +492,16 @@ class TestOpenAIFamilyRendering:
 
     def test_a_caller_level_re_spells_for_the_responses_wire(
             self, monkeypatch):
-        # No live Responses-wire entry declares a surface yet; the branch is
-        # pinned on a synthetic one so it cannot rot unexercised.
+        # The live Responses-wire entries (GPT-5.6) declare a surface now and
+        # exercise this branch for real; the synthetic entry stays because it
+        # pins the `default_on=False` variant, which no live Responses entry
+        # has, so the branch cannot rot if the GPT rows change.
         from direktoro.registry import MODEL_REGISTRY, Model, ThinkingSupport
         monkeypatch.setitem(
             MODEL_REGISTRY, "synthetic-responses-surface",
             Model("openai", "https://api.openai.com/v1", "OPENAI_API_KEY",
-                  wire_api="responses", forced_tool_choice=True,
+                  wire_api="responses", supports_images=True,
+                  forced_tool_choice=True,
                   thinking=ThinkingSupport(
                       modes=(THINKING_ADAPTIVE,),
                       efforts=("low", "medium", "high"), default_on=False)))
@@ -652,10 +667,20 @@ class TestStarvingCapRefused:
         assert dec == {"max_tokens": 1024, "reasoning_effort": "none"}
 
     def test_an_undeclared_surface_is_not_guarded(self):
-        # Nothing established, nothing to guard: the GPT entries carry no
+        # Nothing established, nothing to guard: MiMo carries no
         # ThinkingSupport, so a small cap passes through to the endpoint.
-        dec = resolved_decoding_params("gpt-5.6-sol", max_tokens=64)
-        assert dec["max_output_tokens"] == 64
+        dec = resolved_decoding_params("xiaomi/mimo-v2.5", max_tokens=64)
+        assert dec["max_tokens"] == 64
+
+    def test_the_gpt_entries_are_guarded_now_that_they_declare(self):
+        # The behaviour change that came with declaring the documented GPT-5.6
+        # surface: default_on=True arms the guard, so a spec-less call under
+        # the floor is refused instead of spending its cap on reasoning. This
+        # is the point of declaring it, not a side effect to be worked around.
+        for model_id in ("gpt-5.6-sol", "gpt-5.6-terra"):
+            with pytest.raises(ThinkingUnsupported,
+                               match="cannot fit a reasoning"):
+                resolved_decoding_params(model_id, max_tokens=64)
 
     def test_no_cap_no_guard(self):
         dec = resolved_decoding_params(OPUS_5, max_tokens=None)
@@ -1071,20 +1096,61 @@ class TestRegistryThinkingDeclarations:
 
     def test_the_undeclared_surfaces_are_pinned(self):
         # A surface is declared exactly where evidence exists: the live
-        # Anthropic entries (published reference) and four routed entries
-        # (live probes 2026-08-12) — including Qwen's, whose EMPTY surface is
-        # a probed fact. Undeclared means direktoro refuses a spec rather
-        # than guessing: the three retired ids (unverifiable), the GPT
-        # entries (no current reference read for their levels), and MiMo
-        # (probe rate-limited part-way; see its entry comment).
+        # Anthropic entries and both GPT entries (published reference) and
+        # four routed entries (live probes 2026-08-12) — including Qwen's,
+        # whose EMPTY surface is a probed fact. Undeclared means direktoro
+        # refuses a spec rather than guessing, and only two reasons for that
+        # survive: the three retired ids (a withdrawn endpoint cannot be
+        # re-verified and the new-run gate makes it moot), and MiMo (its probe
+        # was rate-limited part-way AND the gateway's page does not enumerate
+        # the levels, so neither kind of evidence settles it).
+        #
+        # A published statement is sufficient evidence here (see HOW A FACT
+        # GETS INTO THIS TABLE), so an entry left undeclared because nobody
+        # got round to the reading is a BUG, not a state to pin. That is what
+        # the GPT entries were until 2026-08-14.
         from direktoro import MODEL_REGISTRY
 
         undeclared = sorted(model_id for model_id, info in
                             MODEL_REGISTRY.items() if info.thinking is None)
         assert undeclared == sorted([
             "claude-3-5-sonnet-20241022", "claude-opus-4-20250514",
-            "claude-sonnet-4-20250514", "gpt-5.6-sol", "gpt-5.6-terra",
-            "xiaomi/mimo-v2.5"])
+            "claude-sonnet-4-20250514", "xiaomi/mimo-v2.5"])
+
+    def test_the_gpt_surface_says_what_the_reference_documents(self):
+        # OpenAI's reasoning guide and the sol/terra model pages, read
+        # 2026-08-14: "none, low, medium (default), high, xhigh, and max",
+        # with medium in force when reasoning.effort is omitted. Mapped onto
+        # this package's vocabulary: the five ladder rungs are `efforts`, and
+        # OpenAI's "none" is the off-switch, so it is declared as a MODE and
+        # rendered as the level "none" by the OpenAI-family wire code.
+        sol = thinking_support("gpt-5.6-sol")
+        assert set(sol.efforts) == set(EFFORT_LEVELS)
+        assert sol.default_on is True
+        assert sol.default_effort == "medium"
+        assert THINKING_DISABLED in sol.modes
+        assert THINKING_ADAPTIVE in sol.modes
+        # No Anthropic-only concept on a wire that has none.
+        assert sol.displays == ()
+        # Both GPT-5.6 entries state the same documented ladder, which is why
+        # they share one constant rather than transcribing it twice.
+        assert thinking_support("gpt-5.6-terra") == sol
+
+    def test_the_gpt_off_switch_renders_as_the_documented_none_level(self):
+        # "none" is how OpenAI spells "do not reason", and this wire carries
+        # ONE reasoning key, so disabling rides it.
+        dec = resolved_decoding_params(
+            "gpt-5.6-sol", max_tokens=4096,
+            thinking=Thinking(mode=THINKING_DISABLED))
+        assert dec["reasoning"] == {"effort": "none"}
+
+    def test_an_undocumented_gpt_level_is_still_refused(self):
+        # The ladder is a closed list: "minimal" is a real OpenAI value but is
+        # not one of this package's EFFORT_LEVELS and no entry declares it, so
+        # asking for it fails here rather than on a billed call.
+        with pytest.raises(ValueError):
+            resolved_decoding_params("gpt-5.6-sol", max_tokens=4096,
+                                     thinking=Thinking(effort="minimal"))
 
     def test_routed_probed_surfaces_say_what_the_probes_saw(self):
         # The GLM pair: reasons by default, all five ladder levels route, and
