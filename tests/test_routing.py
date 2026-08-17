@@ -215,9 +215,29 @@ class TestVertexTierFold:
                 == _normalise_provider_name("Google"))
         # Every tier variant folds to that same key: the served attribution
         # names the PROVIDER and never the tier, so there is nothing finer for
-        # the fold to compare against.
+        # the fold to compare against. The bare-region (default-tier) tag is in
+        # that set too — it is what google/gemini-3.7-flash pins — so a
+        # standard-tier pin's assertion passes on the same `Google` attribution.
         assert (_normalise_provider_name("google-vertex/global/priority")
                 == _normalise_provider_name("Google"))
+        assert (_normalise_provider_name("google-vertex/global")
+                == _normalise_provider_name("Google"))
+
+    def test_standard_tier_pin_reaches_the_request_body(self):
+        # The re-pin off flex (2026-08-17, after 56/250 calls failed on it) is
+        # only worth anything if the standard tag is what actually goes on the
+        # wire, so the registry entry is followed all the way to the emitted
+        # `provider` object rather than asserted at the dataclass and assumed
+        # after. `order` is the field OpenRouter routes on; nothing downstream
+        # rewrites it.
+        from direktoro.registry import model_info
+
+        obj = provider_object(model_info("google/gemini-3.7-flash").route)
+        assert obj["order"] == ["google-vertex/global"]
+        # And the discipline that stops the gateway substituting a tier of its
+        # own choosing when the pinned one is shedding capacity — which is the
+        # whole failure mode being routed around.
+        assert obj["allow_fallbacks"] is False
 
     def test_flex_pin_assertion_passes_on_google_attribution(self):
         route = _route(upstream=("google-vertex/global/flex",),
@@ -350,4 +370,5 @@ class TestRoutedWireInvariant:
         with pytest.raises(ValueError, match="WIRE_CHAT_COMPLETIONS"):
             Model("openrouter", "https://openrouter.ai/api/v1",
                   "OPENROUTER_API_KEY", wire_api=WIRE_RESPONSES,
+                  supports_images=True,
                   forced_tool_choice=True, route=_route())

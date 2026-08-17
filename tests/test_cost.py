@@ -99,6 +99,7 @@ class TestRetiredFlag:
         # opt-in per entry. (forced_tool_choice has no default and must be
         # stated even here.)
         assert Model("anthropic", None, "ANTHROPIC_API_KEY",
+                     supports_images=True,
                      forced_tool_choice=True).retired is False
 
     def test_withdrawn_ids_are_flagged_retired(self):
@@ -125,6 +126,7 @@ class TestRetiredFlag:
         # looked up for provenance, and it is only NEW runs that reject it. So
         # model_info must NOT raise on one.
         retired = Model("anthropic", None, "ANTHROPIC_API_KEY",
+                        supports_images=True,
                         forced_tool_choice=True, retired=True)
         monkeypatch.setitem(MODEL_REGISTRY, "synthetic-retired-1", retired)
 
@@ -278,6 +280,7 @@ class TestModelFieldOrder:
         # what every registry entry passes positionally, and what the adapters
         # read back to reach a model.
         entry = Model("anthropic", "https://example.invalid/v1", "SOME_KEY_ENV",
+                      supports_images=True,
                       forced_tool_choice=True)
         assert entry.provider == "anthropic"
         assert entry.base_url == "https://example.invalid/v1"
@@ -303,8 +306,11 @@ class TestForcedToolChoiceIsStated:
     and an unstated one is a construction error, not a silent claim."""
 
     def test_unstated_flag_is_refused_at_construction(self):
+        # supports_images is stated so the construction fails on THIS flag and
+        # not on the other sentinel — the two are checked independently.
         with pytest.raises(ValueError, match="forced_tool_choice"):
-            Model("anthropic", None, "ANTHROPIC_API_KEY")
+            Model("anthropic", None, "ANTHROPIC_API_KEY",
+                  supports_images=True)
 
     @pytest.mark.parametrize("value", ["yes", "false", 0, 1, [True]])
     def test_a_non_bool_flag_is_refused(self, value):
@@ -313,6 +319,7 @@ class TestForcedToolChoiceIsStated:
         # paid failure the statement requirement exists to prevent.
         with pytest.raises(ValueError, match="as a bool"):
             Model("anthropic", None, "ANTHROPIC_API_KEY",
+                  supports_images=True,
                   forced_tool_choice=value)
 
     def test_every_registry_entry_states_the_flag(self):
@@ -321,15 +328,60 @@ class TestForcedToolChoiceIsStated:
         for model_id, m in MODEL_REGISTRY.items():
             assert isinstance(m.forced_tool_choice, bool), model_id
 
-    def test_the_flag_is_the_only_field_requiring_statement(self):
+    def test_exactly_two_fields_require_statement(self):
         # The append-only rule's other half used to be "every field after the
-        # third has a default that WORKS". forced_tool_choice deliberately
-        # trades that away, and this pins the trade to exactly one field: a
-        # construction stating only the three positionals plus the flag
-        # succeeds, so no other sentinel has crept in.
+        # third has a default that WORKS". Two fields deliberately trade that
+        # away — supports_images and forced_tool_choice, the two whose default
+        # would read as a capability CLAIM — and this pins the trade to
+        # exactly those: a construction stating only the three positionals
+        # plus both flags succeeds, so no third sentinel has crept in.
         m = Model("anthropic", None, "ANTHROPIC_API_KEY",
+                  supports_images=True,
                   forced_tool_choice=True)
         assert m.retired is False
+        assert m.rejects_sampling == frozenset()
+        assert m.thinking is None
+
+
+class TestSupportsImagesIsStated:
+    """The flag has no working default either, and for the costlier reason: a
+    default of True would make a text-only entry that nobody thought about
+    report as vision-capable, so a consumer sends image parts and is billed for
+    the rejection. Which inputs an endpoint takes is part of registering it."""
+
+    def test_unstated_flag_is_refused_at_construction(self):
+        with pytest.raises(ValueError, match="supports_images"):
+            Model("anthropic", None, "ANTHROPIC_API_KEY",
+                  forced_tool_choice=True)
+
+    @pytest.mark.parametrize("value", ["yes", "false", 0, 1, [True]])
+    def test_a_non_bool_flag_is_refused(self, value):
+        # Same positional exposure as forced_tool_choice: a truthy non-bool
+        # read as True is the paid 400 the statement requirement prevents.
+        with pytest.raises(ValueError, match="as a bool"):
+            Model("anthropic", None, "ANTHROPIC_API_KEY",
+                  supports_images=value, forced_tool_choice=True)
+
+    def test_every_registry_entry_states_the_flag(self):
+        # Import already enforces this (a None would have raised); the assert
+        # documents that the table holds real booleans, not sentinels — which
+        # is what lets a consumer gate a pipeline on the value.
+        for model_id, m in MODEL_REGISTRY.items():
+            assert isinstance(m.supports_images, bool), model_id
+
+    def test_a_text_only_entry_is_expressible_and_reports_as_such(self):
+        # The whole point of removing the default: False must be a value the
+        # table can hold and an accessor can report, so a consumer that
+        # refuses a text-only model has something to refuse on.
+        from direktoro import model_supports_images
+
+        text_only = Model("anthropic", None, "ANTHROPIC_API_KEY",
+                          supports_images=False, forced_tool_choice=True)
+        assert text_only.supports_images is False
+        import pytest as _pytest
+        with _pytest.MonkeyPatch.context() as mp:
+            mp.setitem(MODEL_REGISTRY, "synthetic-text-only", text_only)
+            assert model_supports_images("synthetic-text-only") is False
 
 
 class TestSamplingBands:
@@ -357,14 +409,17 @@ class TestSamplingBands:
 
     def test_every_routed_entry_is_accounted_for(self):
         # The band on a routed entry is OpenRouter's own documented request
-        # range, not an upstream fact a probe could establish — and gemini,
-        # which refuses every sampling control outright, deliberately carries
-        # none. Derived from the table so a new routed entry must take a
-        # position here.
+        # range, not an upstream fact a probe could establish — and the two
+        # Gemini entries, which refuse every sampling control outright,
+        # deliberately carry none. Derived from the table so a new routed entry
+        # must take a position here, and the exceptions are NAMED rather than
+        # read off `rejects_sampling` so that taking the position stays a
+        # deliberate act instead of something an entry falls into.
         for model_id, info in MODEL_REGISTRY.items():
             if info.route is None:
                 continue
-            if model_id == "google/gemini-3.6-flash":
+            if model_id in ("google/gemini-3.6-flash",
+                            "google/gemini-3.7-flash"):
                 assert not info.sampling_bands, model_id
                 continue
             assert sampling_band(model_id, "temperature") == (0.0, 2.0)
@@ -392,7 +447,8 @@ class TestSamplingBands:
                                      [("temperature", (0.0, 1.0))]])
     def test_a_non_mapping_container_is_refused(self, bad):
         with pytest.raises(TypeError, match="must be a dict"):
-            Model("anthropic", None, "K", forced_tool_choice=True,
+            Model("anthropic", None, "K", supports_images=True,
+            forced_tool_choice=True,
                   sampling_bands=bad)
 
     def test_unknown_model_raises(self):
@@ -401,12 +457,14 @@ class TestSamplingBands:
 
     def test_unknown_param_name_refused_at_construction(self):
         with pytest.raises(ValueError, match="not a sampling"):
-            Model("anthropic", None, "K", forced_tool_choice=True,
+            Model("anthropic", None, "K", supports_images=True,
+            forced_tool_choice=True,
                   sampling_bands={"presence_penalty": (0.0, 1.0)})
 
     def test_band_contradicting_a_refusal_is_refused(self):
         with pytest.raises(ValueError, match="rejects_sampling"):
-            Model("anthropic", None, "K", forced_tool_choice=True,
+            Model("anthropic", None, "K", supports_images=True,
+            forced_tool_choice=True,
                   rejects_sampling=frozenset({"temperature"}),
                   sampling_bands={"temperature": (0.0, 1.0)})
 
@@ -422,7 +480,8 @@ class TestSamplingBands:
     ])
     def test_malformed_band_is_refused(self, band):
         with pytest.raises(ValueError, match="low, high"):
-            Model("anthropic", None, "K", forced_tool_choice=True,
+            Model("anthropic", None, "K", supports_images=True,
+            forced_tool_choice=True,
                   sampling_bands={"temperature": band})
 
     def test_out_of_band_value_is_refused_before_spend(self):
@@ -718,13 +777,15 @@ class TestModelInfo:
 
 
 class TestRoutedFrontierEntries:
-    """The two routed frontier entries: xiaomi/mimo-v2.5 (Parasail + Venice,
-    fp8) and google/gemini-3.6-flash (Vertex flex tier). Both are gateway-served
-    and vision-capable; they differ on forced tool_choice per their live probes,
-    and Gemini 3.6 additionally takes no sampling params."""
+    """The three routed frontier entries: xiaomi/mimo-v2.5 (Parasail + Venice,
+    fp8) and the two Gemini Flash entries (both on Vertex, but at DIFFERENT
+    service tiers — 3.6 flex, 3.7 standard). All are gateway-served and
+    vision-capable; they differ on forced tool_choice, and both Gemini entries
+    additionally take no sampling params."""
 
-    def test_both_are_known_and_routed(self):
-        for m in ("xiaomi/mimo-v2.5", "google/gemini-3.6-flash"):
+    def test_all_are_known_and_routed(self):
+        for m in ("xiaomi/mimo-v2.5", "google/gemini-3.6-flash",
+                  "google/gemini-3.7-flash"):
             info = model_info(m)
             assert info.provider == "openrouter"
             assert info.base_url == "https://openrouter.ai/api/v1"
@@ -767,6 +828,48 @@ class TestRoutedFrontierEntries:
         # of 2026-07-24 — so the entry names all three.
         assert info.rejects_sampling == frozenset(
             {"temperature", "top_p", "top_k"})
+
+    def test_gemini_37_pins_vertex_standard_not_flex(self):
+        info = model_info("google/gemini-3.7-flash")
+        # Same gateway, same key, same wire and the same Vertex provider as 3.6,
+        # but a DIFFERENT service tier, and the difference is the point. 3.7
+        # lists the identical three Vertex tiers (global / flex / priority) plus
+        # three Google AI Studio ones; the bare-region `google-vertex/global` tag
+        # is the DEFAULT (standard, on-demand) endpoint. It was flex until
+        # 2026-08-17, when a 250-call consumer run against the flex pin failed 56
+        # calls (32 x HTTP 524/504 upstream origin timeouts, 24 x 429) evenly
+        # across ~100 minutes — sustained capacity-shedding, not a burst — and
+        # the owner ruled the standard tier with the ~2x price accepted.
+        # Asserted rather than described so a hand tidying this row back into
+        # line with its 3.6 neighbour has to bring that ruling with it.
+        assert info.route.upstream == ("google-vertex/global",)
+        assert "flex" not in info.route.upstream[0]
+        # Not the same pin as 3.6, deliberately: the two rows disagree about the
+        # tier and neither is the other's typo.
+        assert (info.route.upstream
+                != model_info("google/gemini-3.6-flash").route.upstream)
+        # Proprietary, quantization reported "unknown" on every endpoint, so no
+        # quant filter — one would exclude the only host there is.
+        assert info.route.quantizations == ()
+        # Single-host pin, so the fallback discipline is what stops a silent
+        # reroute: fail rather than land somewhere unvetted.
+        assert info.route.allow_fallbacks is False
+        assert info.route.zdr is True
+        assert info.route.data_collection == "deny"
+        # Forced named tool_choice is stated on DOCUMENTATION (Google's
+        # function-calling reference and the gateway's supported_parameters,
+        # read 2026-08-17), not on a probe of this slug — which the entry says
+        # in place. Pinned here so flipping it later has to bring the live call
+        # that justifies the flip.
+        assert info.forced_tool_choice is True
+        # The pinned Vertex endpoints list no sampling control at all (read
+        # 2026-08-17). The SAME slug's Google AI Studio endpoints do list
+        # temperature and top_p, so this refusal describes the pin, not the
+        # model — re-pinning would have to re-read the field.
+        assert info.rejects_sampling == frozenset(
+            {"temperature", "top_p", "top_k"})
+        # Figure crops are the reason this entry exists.
+        assert info.supports_images is True
 
     def test_gemini_resolver_drops_temperature_mimo_keeps_it(self):
         # The resolution seam: resolved_decoding_params (the single source of
