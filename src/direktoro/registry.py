@@ -434,8 +434,10 @@ class Model:
     Today's values: Opus 4.7+ and Sonnet 5 refuse all three (the Claude model
     reference lists them as removed for that family); the GPT-5.x reasoning
     entries refuse `temperature`, which is what their documentation states and
-    the only one established for them; Gemini 3.6 Flash refuses all three,
-    which is what its Vertex `supported_parameters` omits.
+    the only one established for them; both Gemini Flash entries refuse all
+    three, which is what their PINNED Vertex endpoints' `supported_parameters`
+    omit — the same slugs' Google AI Studio endpoints list temperature and
+    top_p, so that refusal belongs to the pin rather than to the model.
 
     `resolved_decoding_params` omits a refused param, so the omission is honest —
     the param is absent from BOTH the wire request and the recorded decoding
@@ -782,7 +784,7 @@ _THINK_GLM_VISION = ThinkingSupport(
     efforts=("low", "medium", "high", "xhigh", "max"),
     default_on=True)
 
-# Gemini 3.6 Flash at the pinned Vertex flex endpoint: reasoning runs on a
+# Gemini 3.6 Flash at its pinned Vertex flex endpoint: reasoning runs on a
 # plain call; all five ladder levels are accepted at the wire, which is what
 # `efforts` declares. Two honesty notes on what acceptance does NOT establish:
 # per-level reasoning volumes were non-monotone at one sample per level
@@ -794,10 +796,50 @@ _THINK_GLM_VISION = ThinkingSupport(
 # 400 "Reasoning is mandatory for this endpoint and cannot be disabled" — so
 # there is no disabled mode. ("minimal" was also accepted and returned zero
 # reasoning tokens, but it is not a ladder level and nothing here emits it.)
-_THINK_GEMINI_FLASH = ThinkingSupport(
+_THINK_GEMINI_3_6_FLASH = ThinkingSupport(
     modes=(THINKING_ADAPTIVE,),
     efforts=("low", "medium", "high", "xhigh", "max"),
     default_on=True)
+
+# ---- Gemini 3.7 Flash's thinking surface: DOCUMENTED, NOT PROBED -----------
+# The only constant in this section that no endpoint was called to establish,
+# said here so the two evidence classes above and below are not read as one. A
+# clear published statement is the standard (see HOW A FACT GETS INTO THIS
+# TABLE) and these are two of them, both read 2026-08-17:
+#   - Google's own model reference for `gemini-3.7-flash` states thinking is
+#     supported at "low, medium, high", names MEDIUM the default, and says
+#     minimal "is not supported and returns an error". Those three are the
+#     WHOLE documented ladder, so `efforts` carries exactly them, and
+#     `default_effort="medium"` is a documented omitted-state level — something
+#     the 3.6 record above could not state at all, since neither its reference
+#     nor its probe named one.
+#   - `default_on=True`: the documented default IS a level rather than an
+#     off-switch, so a call sending no thinking parameter still reasons. That
+#     also arms the starving-cap guard (`providers._refuse_starving_cap`), which
+#     is the practical point of declaring it — `max_tokens` covers reasoning
+#     plus answer here as everywhere.
+#   - NO DISABLED MODE. The reference documents no off value and rejects the
+#     lowest rung it does document, so nothing establishes that reasoning can be
+#     turned off. The seam therefore REFUSES a disable request rather than
+#     emitting `reasoning_effort: "none"` on the chance it works — the same
+#     position 3.6 reached from the other direction, where the probe's 400 read
+#     "Reasoning is mandatory for this endpoint and cannot be disabled".
+#   - XHIGH AND MAX ARE DELIBERATELY ABSENT, and their absence is a decision
+#     rather than an omission. OpenRouter maps `reasoning.effort` onto Google's
+#     thinkingLevel one-for-one for low/medium/high and folds "xhigh" DOWN to
+#     "high" upstream, stating no mapping at all for "max" (gateway reasoning
+#     documentation, read 2026-08-17). Declaring xhigh would fingerprint a level
+#     that denotes high's served behaviour; declaring max would record a rung
+#     the model's own reference does not have. The 3.6 record carries both
+#     because a probe watched that wire accept them, and that probe is not
+#     evidence about this model. A caller naming either is refused locally,
+#     before any spend, which is the direction this seam exists to fail in.
+#   - `displays=()`: `thinking.display` is an Anthropic wire concept with no
+#     rendering here, as for every routed entry.
+_THINK_GEMINI_3_7_FLASH = ThinkingSupport(
+    modes=(THINKING_ADAPTIVE,),
+    efforts=("low", "medium", "high"),
+    default_on=True, default_effort="medium")
 
 # Qwen3-VL 235B Instruct: an instruct, non-reasoning endpoint. Every
 # reasoning_effort value 404s under require_parameters ("no endpoints found
@@ -1173,9 +1215,173 @@ MODEL_REGISTRY = {
         # settles all three together. Omit them honestly from wire and
         # fingerprint, and let the require_parameters 404 be the loud backstop.
         rejects_sampling=frozenset({"temperature", "top_p", "top_k"}),
-        thinking=_THINK_GEMINI_FLASH,
+        thinking=_THINK_GEMINI_3_6_FLASH,
         route=Route(gateway=GATEWAY_OPENROUTER,
                     upstream=("google-vertex/global/flex",),
+                    quantizations=())),
+    # Google Gemini 3.7 Flash, pinned to Google Vertex at the STANDARD (default,
+    # on-demand) service tier. NOT flex, and the difference from 3.6 above is
+    # deliberate rather than drift — see LEAVING FLEX below for what moved it.
+    # THIS ENTRY IS DOCUMENTED, NOT PROBED, and that is the first thing to know
+    # about it. Every CAPABILITY field below rests on the gateway's own
+    # /endpoints listing for this slug or on Google's published model reference,
+    # both read 2026-08-17; no OpenRouter endpoint was called to write any of
+    # them. A clear published statement is the standard here (see HOW A FACT GETS
+    # INTO THIS TABLE) and holding a working model out of the table until someone
+    # pays for a probe is exactly what that standard rejects — but this IS a
+    # weaker evidence class than the 3.6 row's live probes, so each field names
+    # the document it came from, and the one field a probe would have settled
+    # differently in kind is called out by name below (forced tool_choice).
+    # THE ONE EXCEPTION IS THE SERVICE TIER, which rests on neither a reference
+    # nor a probe but on a consumer's production run (see LEAVING FLEX below).
+    # No document could have settled it: both tiers are documented and both
+    # serve, and what separated them was how one behaved under an hour of load.
+    #
+    # SLUG, verbatim from the gateway (GET
+    # /api/v1/models/google/gemini-3.7-flash/endpoints, read 2026-08-17):
+    # `google/gemini-3.7-flash`. The registry id IS that slug, as for every
+    # routed entry (id-as-identity). Each endpoint is NAMED
+    # "google/gemini-3.7-flash-20260813", which is the upstream build the slug
+    # currently resolves to and NOT a second id this gateway accepts — the
+    # rolling-slug residual the module docstring describes, anchored per
+    # response by `resolved_model` plus the served-upstream attribution rather
+    # than by anything written here.
+    #
+    # UPSTREAM PIN. The same read lists SIX endpoints for the slug: Google
+    # Vertex at three service tiers (google-vertex/global, .../global/flex,
+    # .../global/priority) and Google AI Studio at three more (google-ai-studio,
+    # .../flex, .../priority). `google-vertex/global` — the DEFAULT-tier Vertex
+    # endpoint — is pinned by its full tag in provider.order, so the tier a call
+    # is served at is DECLARED rather than chosen by the gateway, and
+    # allow_fallbacks False makes a pin that cannot serve fail rather than land
+    # quietly on another tier.
+    # THE BARE-REGION TAG CANNOT FALL INTO A TIER, which is what makes this pin
+    # mean "standard" rather than "whatever Vertex feels like": OpenRouter's
+    # provider-routing reference states that service-tier endpoints (its own
+    # examples are `openai/priority`, `google-vertex/flex`) are NOT matched by
+    # base slugs and "require explicit opt-in via the `service_tier` parameter or
+    # a tier-suffixed slug", and its service-tiers guide states that a request
+    # using neither is "never routed to a non-default service tier"
+    # (https://openrouter.ai/docs/features/provider-routing and
+    # https://openrouter.ai/docs/guides/features/service-tiers, both read
+    # 2026-08-17). This entry sends neither, and names the default endpoint
+    # explicitly on top of that.
+    #
+    # LEAVING FLEX. This row pinned `google-vertex/global/flex` until 2026-08-17,
+    # for the reason 3.6 still does, and it is re-pinned here on OBSERVED RUN
+    # DATA — the one field in this entry that rests on something a document could
+    # not have settled. On 2026-08-17 a consumer ran this model as an extraction
+    # checker against that flex pin: 250 calls over ~100 minutes at concurrency
+    # 10, of which 56 FAILED — 32 as HTTP 524/504 upstream origin timeouts and 24
+    # as 429s — spread evenly across the whole run rather than bunched, which is
+    # sustained capacity-shedding and not a burst outage. That is the flex
+    # bargain behaving as documented rather than a fault: the gateway's
+    # service-tiers guide describes flex as "lower cost, higher latency" and
+    # states that flex "never falls back to a default-tier endpoint", so a
+    # shedding flex tier has nowhere to put the overflow. The owner ruled the
+    # standard tier on 2026-08-17 with the price difference accepted; concurrency
+    # was left at 10, so the tier is the only thing that moved.
+    # WHAT THE TIER COSTS, from the same endpoints read: standard quotes prompt
+    # 0.000000375 and completion 0.000001875 per token — $0.375 / $1.875 per 1M
+    # in / out — against flex's $0.1875 / $0.9375, exactly 2x, both carrying the
+    # same `"discount": 0.5` the listing reports on every Vertex tag. The
+    # gateway's model page shows that same "$0.375 / $1.875 per 1M" under a "50%
+    # off" badge (https://openrouter.ai/google/gemini-3.7-flash, read
+    # 2026-08-17), and OpenRouter states the extra 50% runs "through August 27"
+    # (https://x.com/OpenRouter/status/2087952866409656733), after which the
+    # undiscounted Vertex standard rate should be the $0.75 / $3.75 per 1M the
+    # SAME read quotes for google-ai-studio at `"discount": 0`.
+    # NONE OF THOSE FIGURES PRICES A RUN. A routed call is priced from the
+    # gateway's reported charge on the response, which is exactly why
+    # `direktoro.prices` holds no entry for this id (see its NOT PRICED HERE
+    # note, which names this slug's expiring discount as the reason a copied
+    # rate would rot here). They are recorded as the evidence for the tier
+    # CHOICE, and dated so their staleness is visible.
+    # THE TIER PIN IS REQUEST-SIDE ONLY, exactly as on 3.6, and re-pinning does
+    # not improve that: the served attribution names the provider ("Google") and
+    # never the tier, so `assert_served_upstream` confirms Vertex and nothing
+    # finer, and `reported_cost` is captured and threaded but never compared to a
+    # rate. An identity block for this entry therefore says
+    # "google-vertex/global" on the strength of the token that was SENT. What
+    # backs the tier is the request-side construction above — an explicit
+    # default-tier tag, allow_fallbacks False, and a gateway that opts in to
+    # non-default tiers only when asked — and not a response-side check. See the
+    # 3.6 entry above for the full statement of what that costs; this entry
+    # inherits the limitation, not a verification.
+    # AI STUDIO IS EXCLUDED ON THE WEAKEST BASIS IN THIS ENTRY, so it is stated
+    # plainly rather than left to be inferred from the pin: the 3.6 row records
+    # Google AI Studio as NOT ZDR-capable from a live probe on 2026-07-24, a
+    # provider-level policy this entry REUSES WITHOUT RE-ESTABLISHING IT TODAY.
+    # The public gateway API exposes no privacy field to re-read it from —
+    # `?zdr=true` on the endpoints listing returned all six endpoints unfiltered
+    # on 2026-08-17, so that query settles nothing either way. What makes the pin
+    # safe is construction rather than that evidence: the Route emits zdr True
+    # and data_collection "deny" with allow_fallbacks False, so an endpoint that
+    # cannot serve under the declared policy 404s at routing time instead of
+    # silently routing to a host that retains the request.
+    # SINGLE-PROVIDER DEPENDENCY, as for 3.6: the model is proprietary and Google
+    # is the only party serving it, so there is no second upstream to pin against
+    # churn — a risk a consumer should declare rather than discover.
+    # quantizations=(): every endpoint in the read reports quantization
+    # "unknown" (Vertex is proprietary), so a quant filter would wrongly exclude
+    # the only host there is.
+    #
+    # NO SAMPLING PARAMS AT THE PINNED ENDPOINT. All three Vertex tags list
+    # supported_parameters as reasoning, include_reasoning, max_tokens, seed,
+    # response_format, stop, structured_outputs, tools, tool_choice,
+    # reasoning_effort — and NONE of temperature, top_p or top_k (read
+    # 2026-08-17). One enumeration settles all three together, as on 3.6, so all
+    # three are named in rejects_sampling and `resolved_decoding_params` omits
+    # them from wire and fingerprint alike.
+    # THE SAME READ MAKES THAT REFUSAL ENDPOINT-SCOPED RATHER THAN MODEL-SCOPED,
+    # which is worth recording because the two look identical once written down:
+    # the google-ai-studio tags for THIS SAME SLUG do list temperature and top_p.
+    # So the declaration below describes the PINNED Vertex endpoints, and
+    # re-pinning this entry to AI Studio would have to re-read the field rather
+    # than carry it across. The flex-to-standard re-pin recorded above does NOT
+    # need that: it stays inside the Vertex enumeration, and the standard tag is
+    # one of the three that read identically on 2026-08-17.
+    # Architecture (same read): input text/image/video/file/audio -> text,
+    # context 1,048,576, max completion 65,536. Google's model reference states
+    # the same limits (1,048,576 in / 65,536 out) on the same date.
+    "google/gemini-3.7-flash": Model(
+        PROVIDER_OPENROUTER, OPENROUTER_BASE_URL, OPENROUTER_KEY_ENV,
+        wire_api=WIRE_CHAT_COMPLETIONS,
+        # Two independent published statements, both read 2026-08-17: the
+        # gateway's architecture block lists input_modalities ["text", "image",
+        # "video", "file", "audio"], and Google's own model reference gives the
+        # input modalities as "Text, Image, Video, Audio, and PDF". The consumer
+        # this entry was added for sends figure crops, so image input is the
+        # field that had to be established before any of the others mattered.
+        supports_images=True,
+        # THE ONE FIELD ONLY DOCUMENTATION SUPPORTS, where the 3.6 row above has
+        # a probe. Stated True on three documents, all read 2026-08-17: Google's
+        # model reference lists function calling as supported; Google's
+        # function-calling reference documents mode "any" — "Model is constrained
+        # to always predict a function call" — with an allowed-tools list naming
+        # the function, in examples written against gemini-3.7-flash; and the
+        # gateway lists `tool_choice` in supported_parameters for all three
+        # Vertex tags, its own request reference documenting the named form
+        # {"type": "function", "function": {"name": ...}}.
+        # WHAT THOSE DO NOT ESTABLISH is the gateway-to-upstream path for THIS
+        # slug, which is precisely where the GLM and MiMo rows above found a
+        # documented tool_choice 404ing in its forced form. 3.6 was probed True
+        # at this same provider on 2026-07-24, though at the FLEX tag this entry
+        # no longer pins; that is the nearest evidence there is, and it is
+        # neither this model nor now this tier, so it is not offered as one. The
+        # failure those probes recorded
+        # was a routing-time 404 ("No endpoints found"), which is loud and
+        # precedes generation. If a forced call 404s here, that live call is the
+        # correction (see WHEN A DOCUMENTED VALUE TURNS OUT TO BE WRONG): flip
+        # this flag to False, record the call beside the value it replaced, and
+        # the degrade path a caller needs — tool_choice "auto" plus its own
+        # bounded retry, armed off `supports_forced_tool_choice` — is already
+        # written and already used by three entries above.
+        forced_tool_choice=True,
+        rejects_sampling=frozenset({"temperature", "top_p", "top_k"}),
+        thinking=_THINK_GEMINI_3_7_FLASH,
+        route=Route(gateway=GATEWAY_OPENROUTER,
+                    upstream=("google-vertex/global",),
                     quantizations=())),
 }
 
@@ -1290,13 +1496,14 @@ def model_supports_images(model):
 def supports_forced_tool_choice(model) -> bool:
     """Whether `model`'s endpoint honours a FORCED / named tool_choice.
 
-    True for every direct endpoint (Anthropic, OpenAI) and for two routed
-    entries, the Qwen flagship and Gemini 3.6 Flash. False for three routed
-    entries: the two GLM vision endpoints, whose Z.AI host 404s a forced
+    True for every direct endpoint (Anthropic, OpenAI) and for three routed
+    entries, the Qwen flagship and both Gemini Flash entries. False for three
+    routed entries: the two GLM vision endpoints, whose Z.AI host 404s a forced
     tool_choice through OpenRouter, and MiMo, one of whose two pinned hosts does
     the same for that slug (both confirmed live 2026-07-23; the direct entries'
     values come from the vendors' published tool-use documentation rather than a
-    probe — see HOW A FACT GETS INTO THIS TABLE).
+    probe — see HOW A FACT GETS INTO THIS TABLE, and Gemini 3.7 Flash's True is
+    documentation too, said so on its entry).
     A consumer that forces a named tool consults this to decide whether to arm
     its bounded validate/retry loop: for a False model it sends tool_choice
     "auto" (which `tool_choice_named` already emits) and retries a tool-free
@@ -1317,9 +1524,10 @@ def rejected_sampling_params(model):
     nobody has established a refusal for: this reports declared refusals, never
     acceptances. Today: Opus 4.7+ and Sonnet 5 refuse all of
     `temperature`/`top_p`/`top_k`; the GPT-5.x reasoning entries refuse
-    `temperature`; google/gemini-3.6-flash refuses all three (its Vertex
-    endpoints list none of them in supported_parameters — confirmed live
-    2026-07-24).
+    `temperature`; google/gemini-3.6-flash and google/gemini-3.7-flash refuse
+    all three (their pinned Vertex endpoints list none of them in
+    supported_parameters — confirmed live 2026-07-24 and read from the
+    gateway's endpoints listing 2026-08-17 respectively).
 
     The decoding resolver (`resolved_decoding_params`) consults the field this
     reads and OMITS a refused param from both the wire request and the
@@ -1361,9 +1569,9 @@ def thinking_support(model):
     those; a consumer reads this to size caps deliberately instead of inheriting
     a default it never chose.
 
-    None means the entry has not declared its thinking surface — six of the 16
-    entries today: the two OpenAI entries, one routed entry, and the three
-    retired ids. It does NOT mean "no thinking": it means direktoro will refuse
+    None means the entry has not declared its thinking surface — four of the 17
+    entries today: one routed entry, and the three retired ids. It does NOT
+    mean "no thinking": it means direktoro will refuse
     to emit a thinking shape for that model rather than guess one. Raises
     ValueError for an unknown id, like `model_info`. Mirrors
     `supports_forced_tool_choice` / `rejected_sampling_params` (the field lives

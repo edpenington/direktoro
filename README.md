@@ -199,8 +199,8 @@ which table priced it.
   response carries the `wire_request` actually sent and a plain-dict
   `raw_response`, so a consumer's audit log is redact-and-write.
 
-- **Model registry** — 16 entries: eleven direct (Anthropic and OpenAI) and
-  five routed through OpenRouter. Each records provider, base URL, key
+- **Model registry** — 17 entries: eleven direct (Anthropic and OpenAI) and
+  six routed through OpenRouter. Each records provider, base URL, key
   environment variable, wire protocol, and capability flags for vision, forced
   tool choice and sampling controls, including the documented value range per
   sampling param where one is published. **Vision and forced tool choice are
@@ -209,10 +209,13 @@ which table priced it.
   otherwise report as multi-modal, and a consumer reading it would send image
   parts and be billed for the rejection. Every entry is vision-capable today,
   which is a fact about the table rather than something a new entry inherits.
-  Twelve of the sixteen declare a thinking surface: the six live Anthropic
-  entries and both GPT-5.6 entries from the published reference, and four
-  routed entries from live probes — one of which declares an *empty* surface,
-  an instruct endpoint probed to take no reasoning parameter at all. On the
+  Thirteen of the seventeen declare a thinking surface: the six live Anthropic
+  entries and both GPT-5.6 entries from the published reference, four routed
+  entries from live probes — one of which declares an *empty* surface, an
+  instruct endpoint probed to take no reasoning parameter at all — and one
+  routed entry (Gemini 3.7 Flash) from the vendor's published thinking levels,
+  which is why its ladder is the three levels that reference enumerates rather
+  than the five its probed 3.6 sibling carries. On the
   other four the surface is *undeclared*, which means direktoro refuses to emit
   a thinking shape for them rather than guessing one, not that they cannot
   think: three are retired ids nobody can re-verify, and one is a routed entry
@@ -329,17 +332,38 @@ what the table rests on today is:
   reference** — the model and deprecation tables, the migration guide, the
   thinking and reasoning documentation, the API reference. No Anthropic or
   OpenAI endpoint was called to establish any of them, and none needs to be.
-- **The five routed entries** rest mostly on **live endpoint probes** — the
-  gateway's `/models` and `/endpoints` listings for served upstream,
+- **Five of the six routed entries** rest mostly on **live endpoint probes** —
+  the gateway's `/models` and `/endpoints` listings for served upstream,
   quantization and supported parameters, then a real plain / tool / vision call
   against the pinned endpoint. A pinned upstream's behaviour is exactly what the
   gateway's model page does not tell you, and two hosts serving one slug can
   disagree. Where the gateway's own documented request surface settles the
   question instead (the sampling bands, the effort mapping), the comment says so
   and no probe was run.
+- **The sixth routed entry**, `google/gemini-3.7-flash`, rests on
+  **documentation alone** — the gateway's endpoints listing for the slug and
+  Google's published model reference — and says so at the top of the entry
+  rather than letting the reader assume it was probed like its neighbours. That
+  is the standard working as intended (a published statement is evidence, and
+  holding a working model out of the table until someone pays for a probe is
+  what the standard rejects), but the evidence class is weaker than a probe,
+  so the one field a probe would have settled differently in kind — whether the
+  gateway-to-upstream path honours a *forced* tool choice, which is exactly
+  where three other routed entries found a documented `tool_choice` 404ing — is
+  named in the entry as the place a live call would correct it.
+
+  One field on that entry is now the exception, and it is the only value in the
+  table established by neither reference nor probe: its **service tier**. It was
+  pinned to Vertex flex like its 3.6 neighbour until a consumer's production run
+  on 2026-08-17 failed 56 of 250 calls against that pin — upstream origin
+  timeouts and 429s, evenly spread, i.e. sustained capacity-shedding rather than
+  an outage — and it is re-pinned to the Vertex **standard** tier on that
+  observation, at roughly twice the token rate. Documentation could not have
+  settled it: both tiers are documented and both work, and what separated them
+  was how one behaved under an hour of real load.
 
 Every value's comment carries the date its evidence was read or probed; the
-dates currently in the table run from 2026-07-23 to 2026-08-14.
+dates currently in the table run from 2026-07-23 to 2026-08-17.
 
 A value left at its field default records nothing at all — so a field whose
 default would read as a *claim* does not get one. Two are in that position and

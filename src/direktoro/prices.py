@@ -84,8 +84,14 @@ class PriceEntry:
 # NOT PRICED HERE:
 #   - `claude-3-5-sonnet-20241022`: retired, and the vendor publishes no rate
 #     for it to record.
-#   - the five routed (OpenRouter) entries: a routed call is priced from the
-#     gateway's reported charge on the response.
+#   - the six routed (OpenRouter) entries: a routed call is priced from the
+#     gateway's reported charge on the response. This holds even where the
+#     gateway publishes a rate a hand could copy — google/gemini-3.7-flash's
+#     endpoints listing quotes one per tier AND a `discount` fraction that
+#     expires on a date of the gateway's choosing — because the figure that
+#     prices the run is the one that came back ON the run, and a second,
+#     staler number sitting here would only invite somebody to reconcile the
+#     two.
 PRICES = {
     # ---- Anthropic ----------------------------------------------------------
     # `cache_read_per_1m` is the page's "Cache Hits & Refreshes" column;

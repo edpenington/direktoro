@@ -1175,6 +1175,40 @@ class TestRegistryThinkingDeclarations:
         assert qwen.efforts == ()
         assert qwen.default_on is False
 
+    def test_gemini_37_declares_only_the_documented_ladder(self):
+        # The one routed surface established from DOCUMENTATION rather than a
+        # probe (Google's model reference for gemini-3.7-flash, read
+        # 2026-08-17): thinking_level low / medium / high, medium the default,
+        # minimal an error, and no off value anywhere.
+        gem = thinking_support("google/gemini-3.7-flash")
+        assert gem.efforts == ("low", "medium", "high")
+        # A documented omitted-state level, which 3.6 could not state at all.
+        assert gem.default_on is True
+        assert gem.default_effort == "medium"
+        # Nothing documents an off value and the lowest documented rung errors,
+        # so the seam refuses a disable rather than emitting a level nobody
+        # published.
+        assert THINKING_DISABLED not in gem.modes
+        with pytest.raises(ValueError):
+            resolved_decoding_params("google/gemini-3.7-flash", max_tokens=4096,
+                                     thinking=Thinking(mode=THINKING_DISABLED))
+        # xhigh and max are ABSENT ON PURPOSE: the gateway folds "xhigh" down to
+        # Google's "high" and states no mapping for "max", so declaring either
+        # would fingerprint a level that denotes another's served behaviour.
+        # 3.6 carries both because a probe watched that wire take them, which is
+        # not evidence about this model — so asking for one is refused locally,
+        # before any spend, and a later hand adding them has to bring the read.
+        for level in ("xhigh", "max"):
+            with pytest.raises(ValueError):
+                resolved_decoding_params(
+                    "google/gemini-3.7-flash", max_tokens=4096,
+                    thinking=Thinking(effort=level))
+        # A documented level does ride the chat wire as itself.
+        assert resolved_decoding_params(
+            "google/gemini-3.7-flash", max_tokens=4096,
+            thinking=Thinking(effort="high")) == {
+                "max_tokens": 4096, "reasoning_effort": "high"}
+
 
 def _anthropic_entries():
     from direktoro import MODEL_REGISTRY, PROVIDER_ANTHROPIC

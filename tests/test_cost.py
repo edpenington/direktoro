@@ -409,14 +409,17 @@ class TestSamplingBands:
 
     def test_every_routed_entry_is_accounted_for(self):
         # The band on a routed entry is OpenRouter's own documented request
-        # range, not an upstream fact a probe could establish — and gemini,
-        # which refuses every sampling control outright, deliberately carries
-        # none. Derived from the table so a new routed entry must take a
-        # position here.
+        # range, not an upstream fact a probe could establish — and the two
+        # Gemini entries, which refuse every sampling control outright,
+        # deliberately carry none. Derived from the table so a new routed entry
+        # must take a position here, and the exceptions are NAMED rather than
+        # read off `rejects_sampling` so that taking the position stays a
+        # deliberate act instead of something an entry falls into.
         for model_id, info in MODEL_REGISTRY.items():
             if info.route is None:
                 continue
-            if model_id == "google/gemini-3.6-flash":
+            if model_id in ("google/gemini-3.6-flash",
+                            "google/gemini-3.7-flash"):
                 assert not info.sampling_bands, model_id
                 continue
             assert sampling_band(model_id, "temperature") == (0.0, 2.0)
@@ -774,13 +777,15 @@ class TestModelInfo:
 
 
 class TestRoutedFrontierEntries:
-    """The two routed frontier entries: xiaomi/mimo-v2.5 (Parasail + Venice,
-    fp8) and google/gemini-3.6-flash (Vertex flex tier). Both are gateway-served
-    and vision-capable; they differ on forced tool_choice per their live probes,
-    and Gemini 3.6 additionally takes no sampling params."""
+    """The three routed frontier entries: xiaomi/mimo-v2.5 (Parasail + Venice,
+    fp8) and the two Gemini Flash entries (both on Vertex, but at DIFFERENT
+    service tiers — 3.6 flex, 3.7 standard). All are gateway-served and
+    vision-capable; they differ on forced tool_choice, and both Gemini entries
+    additionally take no sampling params."""
 
-    def test_both_are_known_and_routed(self):
-        for m in ("xiaomi/mimo-v2.5", "google/gemini-3.6-flash"):
+    def test_all_are_known_and_routed(self):
+        for m in ("xiaomi/mimo-v2.5", "google/gemini-3.6-flash",
+                  "google/gemini-3.7-flash"):
             info = model_info(m)
             assert info.provider == "openrouter"
             assert info.base_url == "https://openrouter.ai/api/v1"
@@ -823,6 +828,48 @@ class TestRoutedFrontierEntries:
         # of 2026-07-24 — so the entry names all three.
         assert info.rejects_sampling == frozenset(
             {"temperature", "top_p", "top_k"})
+
+    def test_gemini_37_pins_vertex_standard_not_flex(self):
+        info = model_info("google/gemini-3.7-flash")
+        # Same gateway, same key, same wire and the same Vertex provider as 3.6,
+        # but a DIFFERENT service tier, and the difference is the point. 3.7
+        # lists the identical three Vertex tiers (global / flex / priority) plus
+        # three Google AI Studio ones; the bare-region `google-vertex/global` tag
+        # is the DEFAULT (standard, on-demand) endpoint. It was flex until
+        # 2026-08-17, when a 250-call consumer run against the flex pin failed 56
+        # calls (32 x HTTP 524/504 upstream origin timeouts, 24 x 429) evenly
+        # across ~100 minutes — sustained capacity-shedding, not a burst — and
+        # the owner ruled the standard tier with the ~2x price accepted.
+        # Asserted rather than described so a hand tidying this row back into
+        # line with its 3.6 neighbour has to bring that ruling with it.
+        assert info.route.upstream == ("google-vertex/global",)
+        assert "flex" not in info.route.upstream[0]
+        # Not the same pin as 3.6, deliberately: the two rows disagree about the
+        # tier and neither is the other's typo.
+        assert (info.route.upstream
+                != model_info("google/gemini-3.6-flash").route.upstream)
+        # Proprietary, quantization reported "unknown" on every endpoint, so no
+        # quant filter — one would exclude the only host there is.
+        assert info.route.quantizations == ()
+        # Single-host pin, so the fallback discipline is what stops a silent
+        # reroute: fail rather than land somewhere unvetted.
+        assert info.route.allow_fallbacks is False
+        assert info.route.zdr is True
+        assert info.route.data_collection == "deny"
+        # Forced named tool_choice is stated on DOCUMENTATION (Google's
+        # function-calling reference and the gateway's supported_parameters,
+        # read 2026-08-17), not on a probe of this slug — which the entry says
+        # in place. Pinned here so flipping it later has to bring the live call
+        # that justifies the flip.
+        assert info.forced_tool_choice is True
+        # The pinned Vertex endpoints list no sampling control at all (read
+        # 2026-08-17). The SAME slug's Google AI Studio endpoints do list
+        # temperature and top_p, so this refusal describes the pin, not the
+        # model — re-pinning would have to re-read the field.
+        assert info.rejects_sampling == frozenset(
+            {"temperature", "top_p", "top_k"})
+        # Figure crops are the reason this entry exists.
+        assert info.supports_images is True
 
     def test_gemini_resolver_drops_temperature_mimo_keeps_it(self):
         # The resolution seam: resolved_decoding_params (the single source of
