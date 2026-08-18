@@ -954,6 +954,312 @@ class TestARefusedRoutedResponseIsStillBilled:
 
 
 # ---------------------------------------------------------------------------
+# A gateway failure delivered in the body of a 200
+# ---------------------------------------------------------------------------
+
+def _error_body(code, message):
+    """A gateway error body: HTTP 200, every response field null, `error` set.
+
+    The shape below is the one OpenRouter actually sent (recorded 2026-08-18 on
+    google/gemini-3.7-flash) — the null fields matter as much as the error,
+    because they are why the body reads as a well-formed empty response to
+    everything downstream of it."""
+    return {"id": None, "choices": None, "created": None, "model": None,
+            "object": None, "moderation": None, "service_tier": None,
+            "system_fingerprint": None, "usage": None,
+            "error": {"message": message, "code": code}}
+
+
+class _SequencedChatCompletions(_FakeChatCompletions):
+    """The stub above — its real signature included, since every call still goes
+    through it — answering a different body per call, so a retry can be watched
+    landing on the second one."""
+
+    def __init__(self, raws, sink):
+        super().__init__(raws[0], sink)
+        self._raws = list(raws)
+
+    def create(self, **wire):
+        if self._raws:
+            self._raw = self._raws.pop(0)
+        return super().create(**wire)
+
+
+class TestAGatewayErrorBodyIsNotAResponse:
+    """OpenRouter reports some upstream failures as HTTP 200 with `error` in the
+    body. The SDK does not raise, so the transport translator never sees it, and
+    the body carries no content, no usage, and no attribution.
+
+    Read as a response it is a transient failure wearing the mask of a permanent
+    one: the pin assertion is the first thing to reach it, finds no served
+    provider — because the body has nothing at all in it — and refuses the call
+    as ProviderRouteMismatch, which is deliberately NOT retryable. A 524 the
+    backoff ladder would very likely have survived is then reported as a broken
+    pin, and a consumer that trusts the label degrades the answer for good. The
+    body is classified before anything reads it as a response, so each failure
+    arrives as the class it actually is."""
+
+    def _refused(self, raw, expected, *, model="z-ai/glm-4.6v"):
+        with pytest.raises(expected) as caught:
+            _routed_adapter(raw, {}).create_message(
+                model=model, system="S",
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=4096, sampling={"temperature": 0.0})
+        return caught.value
+
+    def test_an_origin_timeout_is_retryable_not_a_pin_violation(self):
+        # The observed case, verbatim: Cloudflare 524 relayed as code 504.
+        error = self._refused(_error_body(504, "error code: 524\n"),
+                              ProviderRetryableError)
+        assert error.status_code == 504
+        assert "error code: 524" in str(error)
+        # Nothing here is about routing, so nothing here says so.
+        assert not isinstance(error, ProviderRouteMismatch)
+        assert "pin" not in str(error)
+
+    def test_a_rate_limit_in_the_body_is_a_rate_limit(self):
+        # The sharpest case: the single most retryable condition there is,
+        # arriving on the path that used to call it a routing violation.
+        error = self._refused(
+            _error_body(429, "Provider returned error"), ProviderRateLimitError)
+        assert "Provider returned error" in str(error)
+
+    def test_a_non_transient_code_stops_the_call_with_the_gateway_message(self):
+        error = self._refused(_error_body(400, "invalid model id"),
+                              ProviderError)
+        assert type(error) is ProviderError
+        assert "invalid model id" in str(error)
+
+    def test_a_code_that_is_not_a_status_is_not_guessed_at(self):
+        # OpenAI-style string codes carry no HTTP status to classify. Retrying
+        # on a guess would pay for the same refusal four more times.
+        error = self._refused(_error_body("insufficient_quota", "no credit"),
+                              ProviderError)
+        assert type(error) is ProviderError
+        assert "no credit" in str(error)
+
+    def test_a_string_where_the_object_belongs_is_still_read(self):
+        raw = _error_body(500, "x")
+        raw["error"] = "upstream exploded"
+        error = self._refused(raw, ProviderError)
+        assert "upstream exploded" in str(error)
+
+    def test_the_status_is_read_where_a_host_names_it_that_way(self):
+        # An OpenAI-compatible host may carry the HTTP status as `status` and
+        # send `code` as null rather than omitting it.
+        raw = _error_body(None, "upstream unavailable")
+        raw["error"]["status"] = 503
+        error = self._refused(raw, ProviderRetryableError)
+        assert error.status_code == 503
+
+    def test_the_refusal_carries_no_billed_response(self):
+        # Unlike every routing refusal, which is about a call the gateway
+        # already billed: this one is a call that reached the provider and got
+        # an error back, and `usage` is null in the body to prove it. There is
+        # nothing to ledger, so nothing rides on the exception.
+        error = self._refused(_error_body(504, "error code: 524\n"),
+                              ProviderRetryableError)
+        assert error.response is None
+
+    def test_a_transient_body_reaches_the_retry_ladder(self):
+        # The whole point, end to end: the class is what the ladder reads, so
+        # the call that used to be refused now waits and gets its answer.
+        sink = {}
+        client = _FakeChatClient(None, sink)
+        client.chat.completions = _SequencedChatCompletions(
+            [_error_body(504, "error code: 524\n"),
+             _routed_chat_response("z-ai/glm-4.6v", "Z.AI",
+                                   text="{\"ok\": true}")], sink)
+        adapter = OpenAIAdapter(client, provider="openrouter",
+                                base_url=OPENROUTER_BASE_URL)
+        slept = []
+        resp = create_message_with_retry(
+            adapter, _sleep=slept.append, model="z-ai/glm-4.6v", system="S",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=4096, sampling={"temperature": 0.0})
+
+        assert resp.content[0].text == "{\"ok\": true}"
+        assert resp.served_provider == "Z.AI"
+        assert slept == [RETRY_BACKOFF_SECONDS[0]]
+
+    def test_a_response_that_is_a_response_is_untouched(self):
+        # The check must not fire on an ordinary completion, including one whose
+        # body carries an explicit `error: null`.
+        raw = _routed_chat_response("z-ai/glm-4.6v", "Z.AI", text="{\"ok\": 1}")
+        raw["error"] = None
+        resp = _routed_adapter(raw, {}).create_message(
+            model="z-ai/glm-4.6v", system="S",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=4096, sampling={"temperature": 0.0})
+        assert resp.content[0].text == "{\"ok\": 1}"
+        assert resp.served_provider == "Z.AI"
+
+    def test_an_unrouted_call_is_not_left_with_a_silent_empty_completion(
+            self, monkeypatch):
+        # `_attach_routing` is skipped when the entry carries no Route, so on
+        # that path an error body raised NOTHING before: it returned a
+        # successful-looking response with no content and zero tokens, which
+        # reads downstream as "the model produced no answer". The check runs
+        # before that branch, so both paths refuse it. No registry entry pairs
+        # Chat Completions with no Route today; this holds the behaviour for the
+        # one that does.
+        import dataclasses
+
+        unrouted = dataclasses.replace(model_info("z-ai/glm-4.6v"), route=None)
+        monkeypatch.setattr("direktoro.providers.model_info",
+                            lambda model_id: unrouted)
+        error = self._refused(_error_body(504, "error code: 524\n"),
+                              ProviderRetryableError)
+        assert error.status_code == 504
+
+
+# ---------------------------------------------------------------------------
+# A Responses call that did not complete
+# ---------------------------------------------------------------------------
+
+def _failed_response(code, message, *, status="failed"):
+    """A Responses object that failed: a status other than `completed`, an
+    `error`, and — the part that does the damage — an empty `output` that reads
+    as a finished turn with nothing in it."""
+    return {"id": "resp_test", "object": "response", "status": status,
+            "model": "gpt-5.6-terra-2026", "output": [], "usage": None,
+            "incomplete_details": None,
+            "error": {"code": code, "message": message}}
+
+
+class _SequencedResponses(_FakeResponses):
+    """The Responses stub answering a different object per call, so a retry can
+    be watched landing on the second one."""
+
+    def __init__(self, raws, sink):
+        super().__init__(raws[0], sink)
+        self._raws = list(raws)
+
+    def create(self, **wire):
+        if self._raws:
+            self._raw = self._raws.pop(0)
+        return super().create(**wire)
+
+
+class TestAFailedResponsesCallIsNotAnEmptyAnswer:
+    """The Responses path has the same failure-in-the-body shape as the gateway
+    error body above, and its silence is worse.
+
+    `_from_wire` reads `output`, `usage`, `model`, `status` and
+    `incomplete_details` and never `error`, so a `status: "failed"` object
+    normalises to empty content under `end_turn` — a call that reads downstream
+    as a model that finished and said nothing. Nothing raises, nothing is
+    logged, and a consumer for which "nothing further to add" is a legitimate
+    answer records the call as having happened. These hold the two statuses that
+    carry an answer apart from every status that does not."""
+
+    def _refused(self, raw, expected, *, model="gpt-5.6-terra"):
+        adapter = OpenAIAdapter(_FakeOpenAIClient(raw, {}), provider="openai",
+                                base_url=OPENAI_BASE_URL)
+        with pytest.raises(expected) as caught:
+            adapter.create_message(
+                model=model, system="S",
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=4096, sampling={"temperature": 0.0})
+        return caught.value
+
+    def test_a_server_error_is_retryable(self):
+        error = self._refused(_failed_response("server_error", "The model "
+                                               "failed to generate a response"),
+                              ProviderRetryableError)
+        # No HTTP status to record: the failing call never reached one, because
+        # the transport answered 200 and carried this object.
+        assert error.status_code is None
+        assert "failed to generate" in str(error)
+
+    def test_a_rate_limit_is_a_rate_limit(self):
+        error = self._refused(
+            _failed_response("rate_limit_exceeded", "Rate limit reached"),
+            ProviderRateLimitError)
+        assert "Rate limit reached" in str(error)
+
+    def test_a_request_side_code_is_not_retried(self):
+        # `invalid_prompt` and the image-validation family are about the request
+        # as sent. Four more attempts would fail identically and cost the wait.
+        error = self._refused(
+            _failed_response("invalid_prompt", "Your prompt was flagged"),
+            ProviderError)
+        assert type(error) is ProviderError
+        assert "invalid_prompt" in str(error)
+
+    def test_a_status_with_no_answer_is_refused_on_the_status_alone(self):
+        # `cancelled` (and a still-`queued` object) carries no error to read and
+        # no answer either.
+        raw = _failed_response("server_error", "x", status="cancelled")
+        del raw["error"]
+        error = self._refused(raw, ProviderError)
+        assert "cancelled" in str(error)
+
+    def test_the_refusal_carries_no_billed_response(self):
+        error = self._refused(_failed_response("server_error", "boom"),
+                              ProviderRetryableError)
+        assert error.response is None
+
+    def test_a_transient_failure_reaches_the_retry_ladder(self):
+        # End to end on the leg a reviewer runs on: the failed object is
+        # classified, the ladder waits, and the retry returns the answer that
+        # would otherwise have been recorded as an empty one.
+        sink = {}
+        client = _FakeOpenAIClient(None, sink)
+        client.responses = _SequencedResponses(
+            [_failed_response("server_error", "The model failed to generate a "
+                              "response"),
+             {"model": "gpt-5.6-terra-2026", "status": "completed",
+              "output": [{"type": "message", "content": [
+                  {"type": "output_text", "text": "{\"verdict\": \"ok\"}"}]}],
+              "usage": {"input_tokens": 500, "output_tokens": 12}}], sink)
+        adapter = OpenAIAdapter(client, provider="openai",
+                                base_url=OPENAI_BASE_URL)
+        slept = []
+        resp = create_message_with_retry(
+            adapter, _sleep=slept.append, model="gpt-5.6-terra", system="S",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=4096, sampling={"temperature": 0.0})
+
+        assert resp.content[0].text == "{\"verdict\": \"ok\"}"
+        assert resp.stop_reason == "end_turn"
+        assert slept == [RETRY_BACKOFF_SECONDS[0]]
+
+    @pytest.mark.parametrize("status", ["completed", "incomplete"])
+    def test_the_two_statuses_that_carry_an_answer_are_untouched(self, status):
+        raw = {"model": "gpt-5.6-terra-2026", "status": status,
+               "error": None, "incomplete_details": {"reason":
+                                                     "max_output_tokens"},
+               "output": [{"type": "message", "content": [
+                   {"type": "output_text", "text": "{\"verdict\": \"ok\"}"}]}],
+               "usage": {"input_tokens": 500, "output_tokens": 12}}
+        adapter = OpenAIAdapter(_FakeOpenAIClient(raw, {}), provider="openai",
+                                base_url=OPENAI_BASE_URL)
+        resp = adapter.create_message(
+            model="gpt-5.6-terra", system="S",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=4096, sampling={"temperature": 0.0})
+        assert resp.content[0].text == "{\"verdict\": \"ok\"}"
+
+    def test_a_response_with_no_status_at_all_is_left_alone(self):
+        # `_openai_stop_reason` has always read an absent status as an ordinary
+        # turn, and a host that omits the field is not failing. This check is
+        # about statuses that SAY something, not about requiring one.
+        raw = {"model": "gpt-5.6-terra-2026",
+               "output": [{"type": "message", "content": [
+                   {"type": "output_text", "text": "answered"}]}],
+               "usage": {"input_tokens": 5, "output_tokens": 1}}
+        adapter = OpenAIAdapter(_FakeOpenAIClient(raw, {}), provider="openai",
+                                base_url=OPENAI_BASE_URL)
+        resp = adapter.create_message(
+            model="gpt-5.6-terra", system="S",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=4096, sampling={"temperature": 0.0})
+        assert resp.content[0].text == "answered"
+        assert resp.stop_reason == "end_turn"
+
+
+# ---------------------------------------------------------------------------
 # Anthropic cache-write TTL split
 # ---------------------------------------------------------------------------
 

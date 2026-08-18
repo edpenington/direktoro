@@ -75,10 +75,12 @@ class ProviderRetryableError(ProviderError):
     """A transient provider failure worth retrying, other than a rate limit.
 
     `status_code` carries the HTTP status when the failure had one — a 5xx
-    server error, including Anthropic's 529 overloaded — and stays None when the
-    request never reached a status at all, which is the case for a connection
-    that could not be established. Both are retryable for the same reason:
-    nothing was served, so trying again cannot pay twice for one answer.
+    server error, including Anthropic's 529 overloaded — and stays None when
+    there was no status to record: a connection that could not be established
+    never reached one, and a failure reported INSIDE the body of a 200 (the
+    Responses `server_error` of `_translate_responses_error`) does not have one
+    to give. All of them are retryable for the same reason: nothing was served,
+    so trying again cannot pay twice for one answer.
     """
 
     def __init__(self, message, *, status_code=None):
@@ -1253,6 +1255,17 @@ class OpenAIAdapter:
             # raw_response is a plain dict on this adapter exactly as on the
             # Anthropic one, whatever object the client returned.
             raw = response_to_dict(response)
+            # BEFORE ANYTHING READS THIS AS A RESPONSE: a gateway may report an
+            # upstream failure in the body of a 200 rather than as an HTTP
+            # status, and a body carrying `error` is not a response at all.
+            # Classified here, a transient one reaches the retry ladder as the
+            # rate limit or 5xx it is; left to the reader below, it becomes an
+            # empty completion, and on a routed call the pin assertion speaks
+            # first and refuses it — non-retryably — for an attribution an
+            # error body was never going to carry. See `_translate_error_body`.
+            failure = _translate_error_body(raw)
+            if failure is not None:
+                raise failure
             normalised = self._from_chat_wire(raw, canonical=canonical,
                                               wire=wire, decoding=decoding)
             if route is not None:
@@ -1271,6 +1284,14 @@ class OpenAIAdapter:
             raise _translate_openai_error(exc)
 
         raw = response_to_dict(response)
+        # As on the Chat Completions path above, before anything reads this as
+        # a response: a Responses object that failed says so in `status` and
+        # `error`, neither of which the reader below refuses on, and an empty
+        # answer under an ordinary stop reason is the quieter of the two ways
+        # this can go wrong. See `_translate_responses_error`.
+        failure = _translate_responses_error(raw)
+        if failure is not None:
+            raise failure
         return self._from_wire(raw, canonical=canonical, wire=wire,
                                decoding=decoding)
 
@@ -1508,7 +1529,10 @@ def _openai_stop_reason(raw, has_tool_call, *, has_refusal=False):
     """Map a Responses completion to the canonical stop reason.
 
     An `incomplete` status is the output cap when `incomplete_details.reason`
-    says so and a refusal otherwise. A message carrying a `refusal` part is a
+    says so and a refusal otherwise. The statuses that carry no answer at all
+    (`failed` and the rest) never arrive here: `_translate_responses_error`
+    refuses them before the response is read, which is why this maps only the
+    two a caller can be handed. A message carrying a `refusal` part is a
     refusal too, even on a `completed` status: the endpoint completed normally
     and the model declined, and recording that as `end_turn` would file a
     declined call as a finished one. Refusal outranks `tool_use` — a response
@@ -1944,6 +1968,166 @@ def _translate_openai_error(exc):
     if isinstance(exc, openai.APIError):
         return ProviderError(str(exc))
     return exc
+
+
+def _translate_error_body(raw):
+    """Map an OpenAI-compatible error BODY to a normalised ProviderError, or
+    return None when the body is a response.
+
+    A gateway may report an upstream failure as HTTP 200 WITH `error` IN THE
+    BODY rather than as an HTTP status. OpenRouter does this for origin
+    timeouts and shed load, sending `{"error": {"code": 504, "message": "error
+    code: 524"}}` with every other top-level field null. Nothing raised in the
+    SDK, so `_translate_openai_error` never sees it, and `_from_chat_wire`
+    reads `choices` / `usage` / `finish_reason` and never `error` — so the body
+    becomes a well-formed response with empty content and zero tokens. What
+    happens next is worse than the emptiness: on a routed call the pin
+    assertion is the first thing to read that body, finds no attribution
+    because the body carries nothing at all, and refuses it as
+    `ProviderRouteMismatch` — NOT retryable, by design and rightly, since a
+    genuine pin violation is a correctness failure. A transient blip the
+    backoff ladder would have survived is then reported to the caller as a
+    broken pin and its answer is lost for good. On a non-routed call
+    `_attach_routing` does not run at all and the empty completion is simply
+    returned as a success.
+
+    A status in the body is classified EXACTLY as `_translate_openai_error`
+    classifies the same status arriving as an HTTP response — 429 a rate limit,
+    5xx retryable, anything else a plain ProviderError — because where the
+    gateway chose to put the status says nothing about whether the failure is
+    transient. That includes the 504/524 pair: the deliberate non-retry of
+    `APITimeoutError` up there is about a response LOST IN TRANSIT, which may
+    have been served and billed while the caller was not looking, and an error
+    body is the opposite case — it IS the gateway's answer, arriving with no
+    generation id and no usage, so nothing was served that a retry could pay
+    for twice. A `code` that is not an HTTP status (an OpenAI-style string such
+    as "insufficient_quota") is not guessed at: it stops the call loudly with
+    the gateway's own message.
+
+    Raised INSTEAD of a response, so the exception carries no `response`: an
+    error body is a call that "reached the provider and got an error back",
+    which `ProviderError` defines as having no billed material to carry, and
+    the null `usage` in it says the same thing.
+
+    `raw` is a plain dict, so this is exercised offline against hand-authored
+    error bodies, no SDK object required.
+    """
+    error = raw.get("error") if isinstance(raw, dict) else None
+    if not error:
+        return None
+    if isinstance(error, dict):
+        message = str(error.get("message") or "").strip()
+        # `code` is where OpenRouter puts the HTTP status; `status` is accepted
+        # too, for a host that names the same thing the other way. Tested for
+        # None rather than for presence, since a host that carries both sends
+        # the one it does not use as null rather than omitting it.
+        code = error.get("code")
+        if code is None:
+            code = error.get("status")
+    else:
+        # A host that sends a bare string where the documented shape is an
+        # object. There is no status to classify, so it stops the call loudly.
+        message, code = str(error).strip(), None
+    try:
+        status = int(code)
+    except (TypeError, ValueError):
+        status = None
+
+    # The gateway's own words, quoted: it bounds text this layer did not write
+    # (and swallows the trailing newline OpenRouter puts on it). A body whose
+    # message is empty falls back to the whole `error` object, which is then the
+    # most a reader can be given.
+    detail = ("provider reported a failure in the response body rather than as "
+              f"an HTTP status (code {code!r}): {message or error!r}")
+    if status == 429:
+        return ProviderRateLimitError(detail)
+    if status is not None and 500 <= status < 600:
+        return ProviderRetryableError(detail, status_code=status)
+    return ProviderError(detail)
+
+
+# The two Responses statuses `_from_wire` can read as an answer: `completed`,
+# and `incomplete` (the output cap or a filter, which `_openai_stop_reason`
+# renders). The rest of the documented vocabulary — `failed`, `cancelled`,
+# `queued`, `in_progress` — describes a call that produced no answer to read.
+_RESPONSES_READABLE_STATUSES = frozenset({"completed", "incomplete"})
+
+# The Responses error codes worth another attempt, out of a vocabulary that is
+# otherwise about the request itself (`invalid_prompt`, the `invalid_image` /
+# `image_too_large` family) and would fail identically four more times.
+_RESPONSES_RATE_LIMIT_CODE = "rate_limit_exceeded"
+_RESPONSES_RETRYABLE_CODE = "server_error"
+
+
+def _translate_responses_error(raw):
+    """Map a Responses object that did not complete to a normalised
+    ProviderError, or return None when the response is a response.
+
+    THE RESPONSES SIBLING OF `_translate_error_body`, and the same failure in a
+    different vocabulary: the HTTP call succeeded and the failure is a field in
+    the body. A Responses object carries `status` — `completed`, `failed`,
+    `cancelled`, `queued`, `in_progress`, `incomplete` — and an `error` object
+    when it failed. `_from_wire` reads `output`, `usage`, `model`, `status` and
+    `incomplete_details`, and NEVER `error`; `_openai_stop_reason` renders
+    `incomplete` and treats every other status as an ordinary end of turn. So a
+    `status: "failed"` response normalises to empty content under `end_turn`,
+    which reads downstream as a model that finished and said nothing.
+
+    THAT IS THE QUIETEST FAILURE IN THIS FILE — quieter than the gateway error
+    body, which at least raises something. An empty answer under a stop reason
+    saying the turn ended normally is indistinguishable from a model that
+    declined to elaborate, so a caller that treats "nothing further" as a valid
+    outcome records the call as having happened. Nothing is left for an audit
+    log to catch it by.
+
+    The codes are a documented string enum, not HTTP statuses, so they are
+    mapped by name rather than by the arithmetic `_translate_error_body` uses:
+    `rate_limit_exceeded` is a rate limit and `server_error` is retryable
+    (with no `status_code`, because the failing call never reached one — the
+    HTTP response was a 200 carrying this object). Every other documented code
+    is about the request as sent — an invalid prompt, an image too large or in
+    the wrong format — and would fail identically on every retry, so it stops
+    the call loudly instead. A status that is not readable but carries no error
+    object (a `cancelled` or still-`queued` response) is refused on the status
+    alone: there is no answer in it either.
+
+    An ABSENT status is left alone rather than refused. `_openai_stop_reason`
+    already treats it as an ordinary turn, translation fixtures omit it, and
+    this is not the place to start requiring a field that was never required.
+
+    Raised INSTEAD of a response, so no billed material rides on it — as with
+    the error body, and for the same reason: a response that failed was not
+    served, and its `usage` says so.
+
+    `raw` is a plain dict, so this is exercised offline against hand-authored
+    responses, no SDK object required.
+    """
+    if not isinstance(raw, dict):
+        return None
+    error = raw.get("error")
+    status = raw.get("status")
+    if not error:
+        if status is None or status in _RESPONSES_READABLE_STATUSES:
+            return None
+        return ProviderError(
+            f"the Responses call carries status {status!r} and no answer to "
+            "read; it is refused rather than returned as an empty completion.")
+
+    if isinstance(error, dict):
+        code = error.get("code")
+        message = str(error.get("message") or "").strip()
+    else:
+        # A host that sends a bare string where the documented shape is an
+        # object: no code to classify, so it stops the call loudly.
+        code, message = None, str(error).strip()
+    # The provider's own words, quoted — see `_translate_error_body`.
+    detail = (f"the Responses call did not complete (status {status!r}, error "
+              f"code {code!r}): {message or error!r}")
+    if code == _RESPONSES_RATE_LIMIT_CODE:
+        return ProviderRateLimitError(detail)
+    if code == _RESPONSES_RETRYABLE_CODE:
+        return ProviderRetryableError(detail)
+    return ProviderError(detail)
 
 
 # ---------------------------------------------------------------------------

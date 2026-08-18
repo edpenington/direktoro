@@ -190,7 +190,12 @@ which table priced it.
   Responses API and the OpenAI-compatible Chat Completions surface, chosen
   per model by the registry. `create_message` makes exactly one call and
   raises a normalised `ProviderError` (or a retryable subclass) on failure;
-  `create_message_with_retry` is the backoff loop for callers who want one.
+  `create_message_with_retry` is the backoff loop for callers who want one. A
+  failure reported IN THE BODY of a 200 rather than as an HTTP status — an
+  OpenRouter error body, a Responses object whose status is `failed` — is
+  classified into the same normalised classes before the body is read as an
+  answer, so a transient one reaches that loop instead of surfacing as an empty
+  response.
 
 - **Audit-log helpers** — `direktoro.wire_log`: `redact_wire_request` (and
   `redact_messages` / `redact_system`) stub inline base64 image bytes into
