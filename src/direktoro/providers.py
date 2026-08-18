@@ -135,6 +135,27 @@ class ProviderAccountError(ProviderError):
     compose their own message because the reasoning being explained is
     direktoro's and no provider said it. Translated exceptions carry the
     provider's words; originated ones carry ours. Both are deliberate.
+
+    WIDENING THIS CLASS IS A CONTROL-FLOW CHANGE IN OTHER PEOPLE'S PACKAGES,
+    and that is the thing to weigh before adding a member. A consumer does not
+    catch this to log it: it catches it to STOP a run in a way that can be
+    resumed, on the promise that a human will fix something outside the process
+    and the same call will then succeed. So a status admitted here is silently
+    added to what every such consumer already treats as resumable, in a release
+    they did not ask for and without a line of their code changing. They cannot
+    defend against it either — the class carries no discriminator,
+    deliberately, so second-guessing a member from outside would mean reading
+    the message text, which is precisely what this taxonomy exists to spare
+    them. Their declared floor is the whole of their defence.
+
+    THE TEST FOR A NEW MEMBER is therefore not "is this about the account" but
+    "would a human fixing something outside the process make this same call
+    succeed". A 403 is the worked example of the difference: it is a credential
+    status, it reads like a member, and for two of its three meanings on at
+    least one wire it is not one — a blocked prompt is not made acceptable by
+    topping up a balance, and a run paused for it would resume into the block
+    forever. That failure shipped here once, in 0.4.2, on the reasoning that a
+    status means the same thing everywhere.
     """
 
 
