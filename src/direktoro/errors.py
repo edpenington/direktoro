@@ -36,6 +36,28 @@ class ProviderError(Exception):
     fields were established before the refusal — rides on the exception instead
     of being discarded with it, and a consumer catching the refusal can still
     ledger the tokens and any reported cost against the run.
+
+    `provider_message` IS THE PROVIDER'S OWN SENTENCE, lifted out of the error
+    body and set aside from the message. It is what a human is told to DO —
+    "You have no credits remaining. Add credits to continue using the API at
+    ..." — in the words of the party that can act on it, and a consumer showing
+    a failure to an operator wants exactly that and none of the wrapper around
+    it. `str(error)` still carries everything the SDK built, envelope
+    included, so nothing is lost by reading this instead; it is the same text
+    with the machinery taken off.
+
+    It is None on a failure NO PROVIDER SPOKE ON: the routing refusals this
+    package raises itself (a pin mismatch, a missing receipt, a missing cost)
+    are direktoro's reasoning about a response that arrived fine, and inventing
+    a provider sentence for them would misattribute it. `error.provider_message
+    or str(error)` is the line a consumer wants — the clean sentence where
+    there is one, the full text where there is not.
+
+    IT IS SET STRUCTURALLY, off the parsed body, never by reading `str(error)`.
+    That is the point of it: a consumer that would otherwise pick the sentence
+    out of the SDK's rendering is one provider rewording away from showing an
+    operator nothing.
     """
 
     response = None
+    provider_message = None

@@ -195,7 +195,11 @@ which table priced it.
   OpenRouter error body, a Responses object whose status is `failed` — is
   classified into the same normalised classes before the body is read as an
   answer, so a transient one reaches that loop instead of surfacing as an empty
-  response.
+  response. Every provider failure carries `provider_message`, the provider's
+  own sentence lifted out of the error body — what a human is told to do about
+  it, without the envelope the SDK wrapped around it — and None where no
+  provider spoke, so `err.provider_message or str(err)` is what a consumer
+  shows an operator.
 
 - **Audit-log helpers** — `direktoro.wire_log`: `redact_wire_request` (and
   `redact_messages` / `redact_system`) stub inline base64 image bytes into

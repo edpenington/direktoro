@@ -31,7 +31,9 @@ from direktoro.providers import (
     _to_chat_completions_wire,
     _to_openai_wire,
     _translate_anthropic_error,
+    _translate_error_body,
     _translate_openai_error,
+    _translate_responses_error,
     create_message_with_retry,
 )
 from direktoro.registry import (
@@ -1032,11 +1034,26 @@ class TestAGatewayErrorBodyIsNotAResponse:
         assert "invalid model id" in str(error)
 
     def test_a_code_that_is_not_a_status_is_not_guessed_at(self):
-        # OpenAI-style string codes carry no HTTP status to classify. Retrying
-        # on a guess would pay for the same refusal four more times.
-        error = self._refused(_error_body("insufficient_quota", "no credit"),
+        # An UNRECOGNISED string code carries no HTTP status to classify.
+        # Retrying on a guess would pay for the same refusal four more times.
+        error = self._refused(_error_body("some_vendor_code", "no idea"),
                               ProviderError)
         assert type(error) is ProviderError
+        assert not isinstance(error, _RETRYABLE)
+        assert "no idea" in str(error)
+
+    def test_a_named_account_code_is_recognised_without_becoming_retryable(
+            self):
+        # `insufficient_quota` is not a guess: it is the vocabulary this
+        # package already reads off the transport path, and a body in that
+        # dialect carries no HTTP status at all, so without this the one
+        # condition a consumer most wants to recognise arrives here
+        # unclassified. Recognising it must not make it WAITABLE, which is the
+        # invariant the test above is really about — the class is more precise,
+        # not more optimistic.
+        error = self._refused(_error_body("insufficient_quota", "no credit"),
+                              ProviderAccountError)
+        assert not isinstance(error, _RETRYABLE)
         assert "no credit" in str(error)
 
     def test_a_string_where_the_object_belongs_is_still_read(self):
@@ -1069,6 +1086,22 @@ class TestAGatewayErrorBodyIsNotAResponse:
                            "finish_reason": "error"}]
         error = self._refused(raw, ProviderRetryableError)
         assert error.status_code == 503
+
+    def test_an_in_body_402_is_about_the_account(self):
+        # OpenRouter's documented status for a spent balance, arriving in a
+        # body rather than as a status. The consumer that pauses on an account
+        # failure should pause for the gateway balance exactly as it does for
+        # the direct one.
+        error = self._refused(_error_body(402, "Insufficient credits"),
+                              ProviderAccountError)
+        assert "Insufficient credits" in str(error)
+
+    def test_an_in_body_blocked_request_is_not_an_account_failure(self):
+        raw = _error_body(403, "Flagged")
+        raw["error"]["metadata"] = {"reasons": ["hate"],
+                                    "flagged_input": "..."}
+        error = self._refused(raw, ProviderError)
+        assert not isinstance(error, ProviderAccountError)
 
     def test_the_refusal_carries_no_billed_response(self):
         # Unlike every routing refusal, which is about a call the gateway
@@ -1755,14 +1788,48 @@ class TestA429ThatNoWaitCanClear:
         out = translate(_status_error(_sdk(sdk_name), cls_name, status))
         assert type(out) is ProviderAccountError
 
-    def test_the_clause_is_ordered_before_the_general_status_branch(self):
-        # AuthenticationError and PermissionDeniedError both subclass
-        # APIStatusError, so moving the general clause above them would flatten
-        # every credential failure into the base class again — silently, and
-        # with every test but this one still passing.
+    @pytest.mark.parametrize("sdk_name,translate", [
+        ("openai", _translate_openai_error),
+        ("anthropic", _translate_anthropic_error)])
+    def test_a_402_is_about_the_account_on_both_wires(self, sdk_name,
+                                                      translate):
+        # "Your account or API key has insufficient credits" — OpenRouter's
+        # documented 402, read 2026-08-18. The openai SDK has no dedicated
+        # class for this status, which is why classification reads the status
+        # rather than the exception class: an isinstance chain cannot see it.
+        out = translate(_status_error(_sdk(sdk_name), "APIStatusError", 402))
+        assert type(out) is ProviderAccountError
+
+    @pytest.mark.parametrize("metadata", [
+        {"reasons": ["hate"], "flagged_input": "..."},   # moderation flag
+        {"patterns": ["prompt_injection"]},              # guardrail block
+    ])
+    def test_a_blocked_request_is_not_an_account_failure(self, metadata):
+        # THE 403 IS OVERLOADED TOO. OpenRouter documents it as "insufficient
+        # permissions, guardrail block, or moderation flag", and the last two
+        # are about what was ASKED. Classified as an account failure, a
+        # consumer pauses for a human to fix a balance and then resumes into
+        # the same block forever — the exact outcome this class exists to keep
+        # apart from a resumable one.
         sdk = _sdk("openai")
-        assert issubclass(sdk.AuthenticationError, sdk.APIStatusError)
-        assert issubclass(sdk.PermissionDeniedError, sdk.APIStatusError)
+        out = _translate_openai_error(sdk.PermissionDeniedError(
+            "Error code: 403", body={"message": "Flagged", "code": 403,
+                                     "metadata": metadata},
+            response=SimpleNamespace(status_code=403, headers={},
+                                     request=None)))
+        assert type(out) is ProviderError
+        assert not isinstance(out, ProviderAccountError)
+
+    def test_an_unexplained_403_is_still_a_permission_denial(self):
+        # Nothing in the body to go on: read as a permission denial, which
+        # keeps a resumable failure resumable. Only a block SAYING it is a
+        # block moves it.
+        sdk = _sdk("openai")
+        out = _translate_openai_error(sdk.PermissionDeniedError(
+            "Error code: 403", body={"message": "Forbidden", "code": 403},
+            response=SimpleNamespace(status_code=403, headers={},
+                                     request=None)))
+        assert type(out) is ProviderAccountError
 
     def test_the_providers_own_sentence_survives_translation(self):
         # A consumer that pauses on this class shows this text to an operator:
@@ -1829,6 +1896,130 @@ class TestA429ThatNoWaitCanClear:
             create_message_with_retry(adapter, _sleep=slept.append)
         assert adapter.calls == 1
         assert slept == []
+
+
+class TestTheProvidersSentenceArrivesWhole:
+    """`provider_message` carries what the provider actually said, apart from
+    the envelope the SDK wrapped it in.
+
+    A consumer that pauses a run and shows an operator why has one job for this
+    text: say what to do. `str(error)` says it inside a stringified body —
+    "Error code: 429 - {'message': 'You have no credits remaining...',
+    'type': ..., 'param': None}" — which is complete and nearly unreadable.
+    The alternative a consumer reaches for otherwise is picking the sentence
+    out of that rendering, which is one provider rewording away from showing
+    nobody anything. So it is lifted structurally, off the parsed body, at the
+    point where the body is already open."""
+
+    def test_the_base_class_defaults_to_none(self):
+        # `provider_message or str(error)` is the consumer's line, so the
+        # attribute must exist on every provider failure, not only the ones a
+        # translator built.
+        assert ProviderError("no provider spoke").provider_message is None
+
+    def test_the_openai_shape_is_read(self):
+        # The openai client unwraps `{"error": {...}}` before building the
+        # exception, so the message sits at the top level of `body`.
+        sdk = _sdk("openai")
+        body = {"message": "You have no credits remaining. Add credits to "
+                           "continue using the API at "
+                           "https://platform.openai.com/settings/organization/"
+                           "billing/.",
+                "type": "insufficient_quota",
+                "code": "credit_balance_exhausted"}
+        out = _translate_openai_error(sdk.RateLimitError(
+            f"Error code: 429 - {body}", body=body,
+            response=SimpleNamespace(status_code=429, headers={},
+                                     request=None)))
+        assert out.provider_message == (
+            "You have no credits remaining. Add credits to continue using the "
+            "API at https://platform.openai.com/settings/organization/"
+            "billing/.")
+        # The envelope is still on `str`, so nothing is lost by reading the
+        # attribute — it is the same text with the machinery taken off.
+        assert "Error code: 429" in str(out)
+        assert "insufficient_quota" in str(out)
+
+    def test_the_anthropic_shape_is_read(self):
+        # The anthropic client does NOT unwrap: the whole body is passed
+        # through and the message sits one layer down. Reading only the openai
+        # shape would give a clean sentence on one provider and None on the
+        # other — worse than None on both, because a consumer ships the first
+        # and discovers the second.
+        sdk = _sdk("anthropic")
+        body = {"type": "error",
+                "error": {"type": "authentication_error",
+                          "message": "invalid x-api-key"}}
+        out = _translate_anthropic_error(sdk.AuthenticationError(
+            "Error code: 401", body=body,
+            response=SimpleNamespace(status_code=401, headers={},
+                                     request=None)))
+        assert out.provider_message == "invalid x-api-key"
+
+    def test_every_translated_class_carries_it_not_only_account_failures(self):
+        # A human reads a 500 and a 400 too. The attribute is about who SPOKE,
+        # not about which class it landed in.
+        sdk = _sdk("openai")
+        body = {"message": "The server had an error processing your request",
+                "type": "server_error"}
+        out = _translate_openai_error(sdk.InternalServerError(
+            "Error code: 500", body=body,
+            response=SimpleNamespace(status_code=500, headers={},
+                                     request=None)))
+        assert type(out) is ProviderRetryableError
+        assert out.provider_message == (
+            "The server had an error processing your request")
+
+    def test_a_gateway_error_body_carries_the_gateways_words(self):
+        # Here direktoro composes its own sentence about the body, so the two
+        # must not be conflated: `str` is direktoro explaining the refusal,
+        # `provider_message` is what the gateway said.
+        out = _translate_error_body(_error_body(504, "error code: 524\n"))
+        assert out.provider_message == "error code: 524"
+        assert "provider reported a failure in the response body" in str(out)
+
+    def test_a_failed_responses_call_carries_openais_words(self):
+        out = _translate_responses_error(
+            _failed_response("server_error",
+                             "The model failed to generate a response"))
+        assert out.provider_message == (
+            "The model failed to generate a response")
+
+    def test_a_refusal_no_provider_spoke_on_carries_none(self):
+        # The routing refusals are direktoro reasoning about a response that
+        # arrived fine. Inventing a provider sentence for them would
+        # misattribute it, and `provider_message or str(error)` then falls back
+        # to the full explanation, which is the whole of what there is to say.
+        raw = _routed_chat_response("z-ai/glm-4.6v", "Novita")
+        with pytest.raises(ProviderRouteMismatch) as caught:
+            _routed_adapter(raw, {}).create_message(
+                model="z-ai/glm-4.6v", system="S",
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=4096, sampling={"temperature": 0.0})
+        assert caught.value.provider_message is None
+
+    @pytest.mark.parametrize("body", [None, {}, {"message": ""},
+                                      {"message": "   "}, {"message": 7},
+                                      "a bare string", {"error": None}])
+    def test_nothing_usable_reads_as_none_not_as_empty(self, body):
+        # `provider_message or str(error)` must fall back to the full text
+        # rather than to an empty pause note, so anything that is not a
+        # non-empty string is None.
+        sdk = _sdk("openai")
+        out = _translate_openai_error(sdk.RateLimitError(
+            "Error code: 429", body=body,
+            response=SimpleNamespace(status_code=429, headers={},
+                                     request=None)))
+        assert out.provider_message is None
+        assert str(out)
+
+    def test_an_untranslated_exception_is_still_returned_untouched(self):
+        # The single exit must not stamp an attribute onto something this
+        # package did not build.
+        _sdk("openai")
+        original = ValueError("something else entirely")
+        assert _translate_openai_error(original) is original
+        assert not hasattr(original, "provider_message")
 
 
 class TestTranslatorsSurviveAnAbsentSDK:
