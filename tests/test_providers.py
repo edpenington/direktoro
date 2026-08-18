@@ -1034,11 +1034,26 @@ class TestAGatewayErrorBodyIsNotAResponse:
         assert "invalid model id" in str(error)
 
     def test_a_code_that_is_not_a_status_is_not_guessed_at(self):
-        # OpenAI-style string codes carry no HTTP status to classify. Retrying
-        # on a guess would pay for the same refusal four more times.
-        error = self._refused(_error_body("insufficient_quota", "no credit"),
+        # An UNRECOGNISED string code carries no HTTP status to classify.
+        # Retrying on a guess would pay for the same refusal four more times.
+        error = self._refused(_error_body("some_vendor_code", "no idea"),
                               ProviderError)
         assert type(error) is ProviderError
+        assert not isinstance(error, _RETRYABLE)
+        assert "no idea" in str(error)
+
+    def test_a_named_account_code_is_recognised_without_becoming_retryable(
+            self):
+        # `insufficient_quota` is not a guess: it is the vocabulary this
+        # package already reads off the transport path, and a body in that
+        # dialect carries no HTTP status at all, so without this the one
+        # condition a consumer most wants to recognise arrives here
+        # unclassified. Recognising it must not make it WAITABLE, which is the
+        # invariant the test above is really about — the class is more precise,
+        # not more optimistic.
+        error = self._refused(_error_body("insufficient_quota", "no credit"),
+                              ProviderAccountError)
+        assert not isinstance(error, _RETRYABLE)
         assert "no credit" in str(error)
 
     def test_a_string_where_the_object_belongs_is_still_read(self):
@@ -1071,6 +1086,22 @@ class TestAGatewayErrorBodyIsNotAResponse:
                            "finish_reason": "error"}]
         error = self._refused(raw, ProviderRetryableError)
         assert error.status_code == 503
+
+    def test_an_in_body_402_is_about_the_account(self):
+        # OpenRouter's documented status for a spent balance, arriving in a
+        # body rather than as a status. The consumer that pauses on an account
+        # failure should pause for the gateway balance exactly as it does for
+        # the direct one.
+        error = self._refused(_error_body(402, "Insufficient credits"),
+                              ProviderAccountError)
+        assert "Insufficient credits" in str(error)
+
+    def test_an_in_body_blocked_request_is_not_an_account_failure(self):
+        raw = _error_body(403, "Flagged")
+        raw["error"]["metadata"] = {"reasons": ["hate"],
+                                    "flagged_input": "..."}
+        error = self._refused(raw, ProviderError)
+        assert not isinstance(error, ProviderAccountError)
 
     def test_the_refusal_carries_no_billed_response(self):
         # Unlike every routing refusal, which is about a call the gateway
@@ -1757,14 +1788,48 @@ class TestA429ThatNoWaitCanClear:
         out = translate(_status_error(_sdk(sdk_name), cls_name, status))
         assert type(out) is ProviderAccountError
 
-    def test_the_clause_is_ordered_before_the_general_status_branch(self):
-        # AuthenticationError and PermissionDeniedError both subclass
-        # APIStatusError, so moving the general clause above them would flatten
-        # every credential failure into the base class again — silently, and
-        # with every test but this one still passing.
+    @pytest.mark.parametrize("sdk_name,translate", [
+        ("openai", _translate_openai_error),
+        ("anthropic", _translate_anthropic_error)])
+    def test_a_402_is_about_the_account_on_both_wires(self, sdk_name,
+                                                      translate):
+        # "Your account or API key has insufficient credits" — OpenRouter's
+        # documented 402, read 2026-08-18. The openai SDK has no dedicated
+        # class for this status, which is why classification reads the status
+        # rather than the exception class: an isinstance chain cannot see it.
+        out = translate(_status_error(_sdk(sdk_name), "APIStatusError", 402))
+        assert type(out) is ProviderAccountError
+
+    @pytest.mark.parametrize("metadata", [
+        {"reasons": ["hate"], "flagged_input": "..."},   # moderation flag
+        {"patterns": ["prompt_injection"]},              # guardrail block
+    ])
+    def test_a_blocked_request_is_not_an_account_failure(self, metadata):
+        # THE 403 IS OVERLOADED TOO. OpenRouter documents it as "insufficient
+        # permissions, guardrail block, or moderation flag", and the last two
+        # are about what was ASKED. Classified as an account failure, a
+        # consumer pauses for a human to fix a balance and then resumes into
+        # the same block forever — the exact outcome this class exists to keep
+        # apart from a resumable one.
         sdk = _sdk("openai")
-        assert issubclass(sdk.AuthenticationError, sdk.APIStatusError)
-        assert issubclass(sdk.PermissionDeniedError, sdk.APIStatusError)
+        out = _translate_openai_error(sdk.PermissionDeniedError(
+            "Error code: 403", body={"message": "Flagged", "code": 403,
+                                     "metadata": metadata},
+            response=SimpleNamespace(status_code=403, headers={},
+                                     request=None)))
+        assert type(out) is ProviderError
+        assert not isinstance(out, ProviderAccountError)
+
+    def test_an_unexplained_403_is_still_a_permission_denial(self):
+        # Nothing in the body to go on: read as a permission denial, which
+        # keeps a resumable failure resumable. Only a block SAYING it is a
+        # block moves it.
+        sdk = _sdk("openai")
+        out = _translate_openai_error(sdk.PermissionDeniedError(
+            "Error code: 403", body={"message": "Forbidden", "code": 403},
+            response=SimpleNamespace(status_code=403, headers={},
+                                     request=None)))
+        assert type(out) is ProviderAccountError
 
     def test_the_providers_own_sentence_survives_translation(self):
         # A consumer that pauses on this class shows this text to an operator:

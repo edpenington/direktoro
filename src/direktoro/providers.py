@@ -90,25 +90,34 @@ class ProviderAccountError(ProviderError):
     A `ProviderError` like every other refusal, so an existing
     `except ProviderError` catches it unchanged and nothing needs to opt in.
 
-    THREE FAILURES ARRIVE AS THIS, and the third is why the other two are not
-    enough on their own:
+    WHAT ARRIVES AS THIS:
 
-      - A spent balance or a reached spend cap, which OpenAI sends as a 429
-        whose body names the account rather than the rate (see
-        `_OPENAI_SPENT_ACCOUNT_CODES`). Only `_translate_openai_error` reads
-        that one, because overloading 429 for two unrelated conditions is a
-        quirk of that wire.
-      - An authentication failure (401) — a key that is absent, wrong, or
-        revoked.
+      - A spent balance or a reached spend cap. Two wires say it two ways: as
+        a 402, whose meaning is unambiguous ("Your account or API key has
+        insufficient credits"), and as a 429 whose body names the account
+        rather than the rate (see `_OPENAI_SPENT_ACCOUNT_CODES`). Only the
+        OpenAI translator reads the second, because overloading 429 for two
+        unrelated conditions is a quirk of that wire; the 402 is read
+        everywhere, including out of an error body that carries it.
+      - An authentication failure (401) — a key absent, wrong, or revoked.
       - A permission failure (403) — a key that is real but not entitled to
         this model, endpoint or region.
 
-    Both translators map the last two, because unlike the 429 overload a 401
-    and a 403 mean the same thing on every wire, and a consumer whose pause
-    path worked for one provider's credentials and not another's would be
+    AND WHAT DELIBERATELY DOES NOT, THOUGH IT SHARES A STATUS. A 403 is also
+    what at least one gateway returns for a guardrail block or a moderation
+    flag, and those are about what was ASKED. Told to pause on one, a consumer
+    would wait for a human to fix an account and then resume into the same
+    block forever — the exact outcome this class exists to keep apart from a
+    resumable one. So a 403 whose body carries the markers of a block
+    (`_REQUEST_BLOCK_KEYS`) stays a plain `ProviderError`, and an unexplained
+    one is read as a permission denial.
+
+    Both translators map the statuses, because unlike the 429 overload a 401,
+    a 402 and a 403 mean the same thing on every wire, and a consumer whose
+    pause path worked for one provider's credentials and not another's would be
     holding a distinction this package invented rather than one the providers
-    draw. All three are the same fact in different words: the call was refused
-    over who is asking, not over what was asked.
+    draw. All of them are the same fact in different words: the call was
+    refused over who is asking, not over what was asked.
 
     THE MESSAGE IS THE PROVIDER'S OWN SENTENCE AND MUST STAY THAT WAY. Every
     raise site passes `str(exc)` through unchanged, so this carries text like
@@ -1237,18 +1246,17 @@ def _translate_anthropic_error(exc):
     # The ORDER is unchanged and still load-bearing; see the docstring.
     if isinstance(exc, anthropic.RateLimitError):
         failure = ProviderRateLimitError(str(exc))
-    # Credentials, not content — see `ProviderAccountError`. Ordered before the
-    # general status clause these subclass, exactly as on the OpenAI side. No
-    # spent-account clause here: that one reads a 429 body, and overloading
-    # that status is a quirk of the other wire rather than a fact about
-    # billing.
-    elif isinstance(exc, (anthropic.AuthenticationError,
-                          anthropic.PermissionDeniedError)):
-        failure = ProviderAccountError(str(exc))
     elif isinstance(exc, anthropic.APIStatusError):
         code = getattr(exc, "status_code", 0) or 0
+        body = getattr(exc, "body", None)
         if 500 <= code < 600:
             failure = ProviderRetryableError(str(exc), status_code=code)
+        # Credentials and balance, not content — see `ProviderAccountError`,
+        # and `_ACCOUNT_STATUSES` for why this reads the status rather than the
+        # SDK's classes. No spent-account clause here: that one reads a 429
+        # body, and overloading THAT status is a quirk of the other wire.
+        elif code in _ACCOUNT_STATUSES and not _is_request_block(body):
+            failure = ProviderAccountError(str(exc))
         else:
             failure = ProviderError(str(exc))
     # Timeout before connection: the narrower class first, or the retryable
@@ -2028,6 +2036,45 @@ _OPENAI_SPENT_ACCOUNT_CODES = frozenset({
 })
 
 
+# The HTTP statuses that mean the ACCOUNT rather than the request, on any wire:
+# 401 the credential is not valid, 402 the balance will not cover the call, 403
+# the credential is not entitled to this. Unlike the 429 overload below, these
+# three read the same everywhere, so both translators use them.
+_ACCOUNT_STATUSES = frozenset({401, 402, 403})
+
+# EXCEPT THAT 403 IS OVERLOADED TOO, on at least one gateway this package
+# routes through. OpenRouter documents it as "Forbidden (insufficient
+# permissions, guardrail block, or moderation flag)" — and a guardrail or
+# moderation block is about what was ASKED, not who asked it. Classified as an
+# account failure it would tell a consumer to pause and wait for a human to fix
+# a balance, and the resume would meet the same block forever: exactly the
+# outcome `ProviderAccountError` exists to keep apart from a resumable one.
+#
+# They are told apart structurally, by metadata a block carries and a
+# permission denial does not — `reasons` and `flagged_input` on a moderation
+# flag, `patterns` on a guardrail block (OpenRouter's documented error shape,
+# read 2026-08-18).
+_REQUEST_BLOCK_KEYS = frozenset({"reasons", "flagged_input", "patterns"})
+
+
+def _is_request_block(body):
+    """True when an error body shows the REQUEST was blocked, not the account.
+
+    Reads the same two shapes as `_provider_message`, for the same reason, and
+    answers False when there is nothing to go on — an unexplained 403 is a
+    permission denial until something in the body says otherwise, which is the
+    reading that keeps a resumable failure resumable.
+    """
+    for layer in (body, (body or {}).get("error") if isinstance(body, dict)
+                  else None):
+        if isinstance(layer, dict):
+            metadata = layer.get("metadata")
+            if isinstance(metadata, dict) and (
+                    _REQUEST_BLOCK_KEYS & set(metadata)):
+                return True
+    return False
+
+
 def _provider_message(body):
     """The provider's own sentence out of a parsed error body, or None.
 
@@ -2136,17 +2183,18 @@ def _translate_openai_error(exc):
             failure = ProviderAccountError(str(exc))
         else:
             failure = ProviderRateLimitError(str(exc))
-    # Credentials, not content. BEFORE the general status clause, which these
-    # both subclass and which would otherwise flatten them into the base class
-    # along with the 400s — the same ordering discipline the timeout clause
-    # below depends on.
-    elif isinstance(exc, (openai.AuthenticationError,
-                          openai.PermissionDeniedError)):
-        failure = ProviderAccountError(str(exc))
     elif isinstance(exc, openai.APIStatusError):
         code = getattr(exc, "status_code", 0) or 0
+        body = getattr(exc, "body", None)
         if 500 <= code < 600:
             failure = ProviderRetryableError(str(exc), status_code=code)
+        # Credentials and balance, not content — and read off the STATUS rather
+        # than off the SDK's exception classes, which is what lets 402 in at
+        # all (the openai SDK has no dedicated class for it) and what retires
+        # the ordering hazard that testing AuthenticationError before its
+        # parent used to carry.
+        elif code in _ACCOUNT_STATUSES and not _is_request_block(body):
+            failure = ProviderAccountError(str(exc))
         else:
             failure = ProviderError(str(exc))
     # Timeout before connection: the narrower class first, or the retryable
@@ -2218,10 +2266,16 @@ def _translate_error_body(raw):
         code = error.get("code")
         if code is None:
             code = error.get("status")
+        # The OpenAI-style vocabulary, where the account is named rather than
+        # numbered. A body in that dialect carries no HTTP status at all, so
+        # without this the one condition a consumer most wants to recognise
+        # arrives on this path as an unclassified refusal.
+        named = {value for value in (code, error.get("type"))
+                 if isinstance(value, str)}
     else:
         # A host that sends a bare string where the documented shape is an
         # object. There is no status to classify, so it stops the call loudly.
-        message, code = str(error).strip(), None
+        message, code, named = str(error).strip(), None, set()
     try:
         status = int(code)
     except (TypeError, ValueError):
@@ -2233,7 +2287,16 @@ def _translate_error_body(raw):
     # most a reader can be given.
     detail = ("provider reported a failure in the response body rather than as "
               f"an HTTP status (code {code!r}): {message or error!r}")
-    if status == 429:
+    # The account first, whichever way the body names it — by one of the codes
+    # that mean a spent balance, or by a status that means the credential or
+    # the balance rather than the request. Before the 429 clause, because a
+    # rate limit and an exhausted quota can arrive under the same status and
+    # only one of them is worth waiting for; see `_OPENAI_SPENT_ACCOUNT_CODES`.
+    if named & _OPENAI_SPENT_ACCOUNT_CODES:
+        failure = ProviderAccountError(detail)
+    elif status in _ACCOUNT_STATUSES and not _is_request_block(raw):
+        failure = ProviderAccountError(detail)
+    elif status == 429:
         failure = ProviderRateLimitError(detail)
     elif status is not None and 500 <= status < 600:
         failure = ProviderRetryableError(detail, status_code=status)
