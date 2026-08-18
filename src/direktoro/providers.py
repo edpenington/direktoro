@@ -71,6 +71,47 @@ class ProviderRateLimitError(ProviderError):
     """Rate-limited (HTTP 429). Retryable with backoff."""
 
 
+class ProviderAccountError(ProviderError):
+    """The provider refused this call over the ACCOUNT, not the request.
+
+    A spent credit balance, a reached spend cap — a state of the account or the
+    environment the call was made from. Nothing about the inputs is wrong, and
+    no retry clears it: the fix is outside the process entirely.
+
+    THIS IS A SECOND AXIS, not a finer grade of the retryable one. Retryable
+    asks "can waiting help"; this asks "is the request at fault". They are
+    orthogonal, and only a translator can answer the second, because by the
+    time an exception reaches a caller the body that distinguished them is a
+    string. A caller that catches this can stop and be resumed once someone
+    tops the account up, where the same handling on a plain `ProviderError`
+    would also stop on a malformed request — a fault a resume hits again
+    forever.
+
+    A `ProviderError` like every other refusal, so an existing
+    `except ProviderError` catches it unchanged and nothing needs to opt in.
+
+    THREE FAILURES ARRIVE AS THIS, and the third is why the other two are not
+    enough on their own:
+
+      - A spent balance or a reached spend cap, which OpenAI sends as a 429
+        whose body names the account rather than the rate (see
+        `_OPENAI_SPENT_ACCOUNT_CODES`). Only `_translate_openai_error` reads
+        that one, because overloading 429 for two unrelated conditions is a
+        quirk of that wire.
+      - An authentication failure (401) — a key that is absent, wrong, or
+        revoked.
+      - A permission failure (403) — a key that is real but not entitled to
+        this model, endpoint or region.
+
+    Both translators map the last two, because unlike the 429 overload a 401
+    and a 403 mean the same thing on every wire, and a consumer whose pause
+    path worked for one provider's credentials and not another's would be
+    holding a distinction this package invented rather than one the providers
+    draw. All three are the same fact in different words: the call was refused
+    over who is asking, not over what was asked.
+    """
+
+
 class ProviderRetryableError(ProviderError):
     """A transient provider failure worth retrying, other than a rate limit.
 
@@ -1161,6 +1202,11 @@ def _translate_anthropic_error(exc):
     subclasses `APIConnectionError` in this SDK, so it is tested first, and
     swapping the two clauses would silently make every timeout retryable.
 
+    NOT RETRYABLE, AND SAID SO: a 401 or a 403 becomes `ProviderAccountError`
+    rather than a bare `ProviderError`. The call was refused over who is
+    asking, not over what was asked, and a caller that can pause for a
+    credential wants that apart from a malformed request. See that class.
+
     Unknown exceptions are returned unchanged so genuinely unexpected errors
     still surface with their original type and traceback.
     """
@@ -1171,6 +1217,14 @@ def _translate_anthropic_error(exc):
 
     if isinstance(exc, anthropic.RateLimitError):
         return ProviderRateLimitError(str(exc))
+    # Credentials, not content — see `ProviderAccountError`. Ordered before the
+    # general status clause these subclass, exactly as on the OpenAI side. No
+    # spent-account clause here: that one reads a 429 body, and overloading
+    # that status is a quirk of the other wire rather than a fact about
+    # billing.
+    if isinstance(exc, (anthropic.AuthenticationError,
+                        anthropic.PermissionDeniedError)):
+        return ProviderAccountError(str(exc))
     if isinstance(exc, anthropic.APIStatusError):
         code = getattr(exc, "status_code", 0) or 0
         if 500 <= code < 600:
@@ -1994,7 +2048,11 @@ def _translate_openai_error(exc):
     again, turning a fast failure into a slow one. The narrow set of codes that
     mean the account is `_OPENAI_SPENT_ACCOUNT_CODES`; everything else about a
     429 stays retryable, because retrying a rate limit is the right default and
-    this exemption is not an invitation to widen it. Only this translator
+    this exemption is not an invitation to widen it. It becomes a
+    `ProviderAccountError` rather than a bare `ProviderError`, because this
+    clause has to establish that the account is at fault in order to decide
+    not to retry, and a caller cannot recover that from the exception's string
+    afterwards; see that class for the axis it names. Only this translator
     carries the clause, because this is the wire the overload was observed on;
     a spent account arriving as a 4xx other than 429 is already non-retryable
     on both.
@@ -2008,6 +2066,13 @@ def _translate_openai_error(exc):
     retry itself. The ORDER below is load-bearing: `APITimeoutError` subclasses
     `APIConnectionError` in this SDK too, so it is tested first, and swapping
     the two clauses would silently make every timeout retryable.
+
+    NOT RETRYABLE, AND SAID SO: a 401 or a 403 becomes `ProviderAccountError`
+    rather than a bare `ProviderError`. The call was refused over who is
+    asking, not over what was asked, and a caller that can pause for a
+    credential wants that apart from a malformed request. Ordered before the
+    general status clause these two subclass, for the same reason the timeout
+    is ordered before the connection error. See that class.
     """
     try:
         import openai
@@ -2018,8 +2083,15 @@ def _translate_openai_error(exc):
         # A 429 the ladder cannot clear. See the docstring and
         # `_OPENAI_SPENT_ACCOUNT_CODES`.
         if _openai_error_codes(exc) & _OPENAI_SPENT_ACCOUNT_CODES:
-            return ProviderError(str(exc))
+            return ProviderAccountError(str(exc))
         return ProviderRateLimitError(str(exc))
+    # Credentials, not content. BEFORE the general status clause, which these
+    # both subclass and which would otherwise flatten them into the base class
+    # along with the 400s — the same ordering discipline the timeout clause
+    # below depends on.
+    if isinstance(exc, (openai.AuthenticationError,
+                        openai.PermissionDeniedError)):
+        return ProviderAccountError(str(exc))
     if isinstance(exc, openai.APIStatusError):
         code = getattr(exc, "status_code", 0) or 0
         if 500 <= code < 600:

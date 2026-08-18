@@ -22,6 +22,7 @@ from direktoro.providers import (
     NormalisedResponse,
     NormalisedUsage,
     OpenAIAdapter,
+    ProviderAccountError,
     ProviderError,
     ProviderRateLimitError,
     ProviderRetryableError,
@@ -156,6 +157,11 @@ __all__ = [
     "ProviderError",
     "ProviderRateLimitError",
     "ProviderRetryableError",
+    # A refusal about the ACCOUNT rather than the request (a spent balance, a
+    # reached cap). A second axis, not a finer grade of retryable: a caller
+    # can stop and be resumed on this where the same handling on the base
+    # class would also stop on a malformed request.
+    "ProviderAccountError",
     # Normalised response
     "NormalisedResponse",
     "NormalisedUsage",
