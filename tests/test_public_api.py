@@ -40,6 +40,7 @@ EXPECTED_PUBLIC_API = [
     "ProviderError",
     "ProviderRateLimitError",
     "ProviderRetryableError",
+    "ProviderAccountError",
     "MissingAPIKey",
     "NormalisedResponse",
     "NormalisedUsage",

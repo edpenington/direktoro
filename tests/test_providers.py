@@ -20,6 +20,7 @@ from direktoro.providers import (
     NormalisedResponse,
     NormalisedUsage,
     OpenAIAdapter,
+    ProviderAccountError,
     ProviderError,
     ProviderRateLimitError,
     ProviderRetryableError,
@@ -1683,6 +1684,136 @@ class TestOpenAIErrorTranslation:
         _sdk("openai")
         original = ValueError("something else entirely")
         assert _translate_openai_error(original) is original
+
+
+class TestA429ThatNoWaitCanClear:
+    """OpenAI overloads HTTP 429 for two unrelated conditions: throttling, the
+    most retryable failure there is, and a spent account, the least.
+
+    Classifying on the status alone climbs the whole ladder for a credit
+    balance no wait restores. Recorded 2026-08-18 on a live review leg: four
+    calls walked (2, 5, 11, 23) to exhaustion, ~41 seconds each, to arrive at
+    what the first response had already said — and on a longer batch every
+    subsequent call pays that again, which turns a fast failure into a slow
+    one. The distinguishing evidence is never the status; it is `type` /
+    `code` in the body."""
+
+    # The body as recorded, verbatim.
+    SPENT = {"message": "You have no credits remaining. Add credits to "
+                        "continue using the API at "
+                        "https://platform.openai.com/settings/organization/"
+                        "billing/.",
+             "type": "insufficient_quota", "param": None,
+             "code": "credit_balance_exhausted"}
+
+    def _rate_limit(self, body):
+        sdk = _sdk("openai")
+        return sdk.RateLimitError("Error code: 429", body=body,
+                                  response=SimpleNamespace(
+                                      status_code=429, headers={},
+                                      request=None))
+
+    def test_a_spent_account_is_not_a_rate_limit(self):
+        out = _translate_openai_error(self._rate_limit(self.SPENT))
+        assert not isinstance(out, ProviderRateLimitError)
+
+    def test_a_spent_account_says_it_is_about_the_account(self):
+        # The second axis. This clause has to establish that the account is at
+        # fault in order to decide not to retry, and flattening that into the
+        # base class throws the finding away: a caller would then see the same
+        # type for a spent balance and for a malformed request, which want
+        # opposite handling — one is resumable once someone tops up, the other
+        # is a fault a resume hits again forever. By the time the exception
+        # reaches a caller the body that distinguished them is a string.
+        out = _translate_openai_error(self._rate_limit(self.SPENT))
+        assert type(out) is ProviderAccountError
+
+    def test_it_is_caught_as_a_provider_failure_like_any_other(self):
+        # Backward compatible by construction: a consumer that never opts in
+        # keeps catching it with the `except ProviderError` it already has.
+        assert isinstance(
+            _translate_openai_error(self._rate_limit(self.SPENT)),
+            ProviderError)
+
+    @pytest.mark.parametrize("cls_name,status", [("AuthenticationError", 401),
+                                                 ("PermissionDeniedError",
+                                                  403)])
+    @pytest.mark.parametrize("sdk_name,translate", [
+        ("openai", _translate_openai_error),
+        ("anthropic", _translate_anthropic_error)])
+    def test_credentials_are_about_the_account_on_both_wires(
+            self, sdk_name, translate, cls_name, status):
+        # A 401 and a 403 mean the same thing on every wire, unlike the 429
+        # overload, so both translators carry these. A pause path that worked
+        # for one provider's credentials and not another's would be holding a
+        # distinction this package invented rather than one the providers draw.
+        out = translate(_status_error(_sdk(sdk_name), cls_name, status))
+        assert type(out) is ProviderAccountError
+
+    def test_the_clause_is_ordered_before_the_general_status_branch(self):
+        # AuthenticationError and PermissionDeniedError both subclass
+        # APIStatusError, so moving the general clause above them would flatten
+        # every credential failure into the base class again — silently, and
+        # with every test but this one still passing.
+        sdk = _sdk("openai")
+        assert issubclass(sdk.AuthenticationError, sdk.APIStatusError)
+        assert issubclass(sdk.PermissionDeniedError, sdk.APIStatusError)
+
+    def test_a_malformed_request_is_not_about_the_account(self):
+        # The distinction earns its keep only if the other side holds: a 400
+        # is about the request and must NOT arrive as an account failure, or a
+        # consumer pausing on this class would pause on a config fault.
+        out = _translate_openai_error(
+            _status_error(_sdk("openai"), "APIStatusError", 400))
+        assert type(out) is ProviderError
+        assert not isinstance(out, ProviderAccountError)
+
+    def test_an_ordinary_429_still_retries(self):
+        # The default is unchanged and must stay unchanged: this exemption is
+        # narrow, and a throttled call is exactly what the ladder is for.
+        out = _translate_openai_error(self._rate_limit(
+            {"message": "Rate limit reached for gpt-5.6-terra",
+             "type": "rate_limit_error", "code": "rate_limit_exceeded"}))
+        assert type(out) is ProviderRateLimitError
+
+    def test_a_429_with_no_body_at_all_still_retries(self):
+        out = _translate_openai_error(self._rate_limit(None))
+        assert type(out) is ProviderRateLimitError
+
+    @pytest.mark.parametrize("code", ["insufficient_quota",
+                                      "credit_balance_exhausted",
+                                      "billing_hard_limit_reached"])
+    def test_each_spent_account_code_is_refused(self, code):
+        out = _translate_openai_error(
+            self._rate_limit({"message": "no credit", "code": code}))
+        assert type(out) is ProviderAccountError
+
+    def test_the_envelope_is_read_where_a_client_did_not_unwrap_it(self):
+        # The SDK's concrete client unwraps `{"error": {...}}` before building
+        # the exception, but this package supports an injected client, and the
+        # base class does not unwrap. Reading only the top level would fall
+        # back to a retry on the nested shape.
+        out = _translate_openai_error(
+            self._rate_limit({"error": dict(self.SPENT)}))
+        assert type(out) is ProviderAccountError
+
+    def test_the_ladder_does_not_climb_for_it(self):
+        # The point of the classification, end to end: no sleep, one attempt.
+        class _Spent:
+            def __init__(self, exc):
+                self.exc = exc
+                self.calls = 0
+
+            def create_message(self, **kwargs):
+                self.calls += 1
+                raise _translate_openai_error(self.exc)
+
+        adapter = _Spent(self._rate_limit(self.SPENT))
+        slept = []
+        with pytest.raises(ProviderError):
+            create_message_with_retry(adapter, _sleep=slept.append)
+        assert adapter.calls == 1
+        assert slept == []
 
 
 class TestTranslatorsSurviveAnAbsentSDK:
