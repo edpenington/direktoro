@@ -1708,7 +1708,12 @@ class TestA429ThatNoWaitCanClear:
 
     def _rate_limit(self, body):
         sdk = _sdk("openai")
-        return sdk.RateLimitError("Error code: 429", body=body,
+        # The message is built the way the SDK builds it —
+        # `f"Error code: {status} - {body}"` in `_make_status_error_from_response`
+        # — because one of these tests is about what the message CARRIES, and a
+        # fixture that invents a tidier message than the SDK produces would
+        # assert that property against text this package will never see.
+        return sdk.RateLimitError(f"Error code: 429 - {body}", body=body,
                                   response=SimpleNamespace(
                                       status_code=429, headers={},
                                       request=None))
@@ -1758,6 +1763,16 @@ class TestA429ThatNoWaitCanClear:
         sdk = _sdk("openai")
         assert issubclass(sdk.AuthenticationError, sdk.APIStatusError)
         assert issubclass(sdk.PermissionDeniedError, sdk.APIStatusError)
+
+    def test_the_providers_own_sentence_survives_translation(self):
+        # A consumer that pauses on this class shows this text to an operator:
+        # it is an instruction, from the party that can act on it. Nothing in
+        # this package reads it, which is exactly why a later refactor could
+        # replace it with a tidy constant and break nothing that is asserted
+        # anywhere else. Asserted here.
+        out = _translate_openai_error(self._rate_limit(self.SPENT))
+        assert "You have no credits remaining" in str(out)
+        assert "platform.openai.com" in str(out)
 
     def test_a_malformed_request_is_not_about_the_account(self):
         # The distinction earns its keep only if the other side holds: a 400

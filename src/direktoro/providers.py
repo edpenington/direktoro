@@ -109,6 +109,23 @@ class ProviderAccountError(ProviderError):
     holding a distinction this package invented rather than one the providers
     draw. All three are the same fact in different words: the call was refused
     over who is asking, not over what was asked.
+
+    THE MESSAGE IS THE PROVIDER'S OWN SENTENCE AND MUST STAY THAT WAY. Every
+    raise site passes `str(exc)` through unchanged, so this carries text like
+    "You have no credits remaining. Add credits to continue using the API at
+    ..." — an instruction to a human, in the words of the party that can
+    actually act on it. A consumer that pauses on this class SHOWS that
+    sentence to its operator and never reads it, which is the right division:
+    the type decides, the string informs. Replacing it with a tidy constant
+    would read as a cleanup, break nothing any test asserts, and quietly leave
+    an operator with "the provider refused" where they had been told what to
+    do about it.
+
+    Note the contrast with the refusals this package RAISES ITSELF — the pin
+    mismatch, the missing receipt, the missing cost, the error body — which
+    compose their own message because the reasoning being explained is
+    direktoro's and no provider said it. Translated exceptions carry the
+    provider's words; originated ones carry ours. Both are deliberate.
     """
 
 
