@@ -1232,31 +1232,38 @@ def _translate_anthropic_error(exc):
     except ImportError:
         return exc
 
+    # An elif chain rather than a series of returns, so every translated failure
+    # leaves by ONE exit and the provider's sentence is attached there once.
+    # The ORDER is unchanged and still load-bearing; see the docstring.
     if isinstance(exc, anthropic.RateLimitError):
-        return ProviderRateLimitError(str(exc))
+        failure = ProviderRateLimitError(str(exc))
     # Credentials, not content — see `ProviderAccountError`. Ordered before the
     # general status clause these subclass, exactly as on the OpenAI side. No
     # spent-account clause here: that one reads a 429 body, and overloading
     # that status is a quirk of the other wire rather than a fact about
     # billing.
-    if isinstance(exc, (anthropic.AuthenticationError,
-                        anthropic.PermissionDeniedError)):
-        return ProviderAccountError(str(exc))
-    if isinstance(exc, anthropic.APIStatusError):
+    elif isinstance(exc, (anthropic.AuthenticationError,
+                          anthropic.PermissionDeniedError)):
+        failure = ProviderAccountError(str(exc))
+    elif isinstance(exc, anthropic.APIStatusError):
         code = getattr(exc, "status_code", 0) or 0
         if 500 <= code < 600:
-            return ProviderRetryableError(str(exc), status_code=code)
-        return ProviderError(str(exc))
+            failure = ProviderRetryableError(str(exc), status_code=code)
+        else:
+            failure = ProviderError(str(exc))
     # Timeout before connection: the narrower class first, or the retryable
     # connection clause below would swallow it. See the docstring.
-    if isinstance(exc, anthropic.APITimeoutError):
-        return ProviderError(str(exc))
-    if isinstance(exc, anthropic.APIConnectionError):
+    elif isinstance(exc, anthropic.APITimeoutError):
+        failure = ProviderError(str(exc))
+    elif isinstance(exc, anthropic.APIConnectionError):
         # No status to record: the request never reached one.
-        return ProviderRetryableError(str(exc))
-    if isinstance(exc, anthropic.APIError):
-        return ProviderError(str(exc))
-    return exc
+        failure = ProviderRetryableError(str(exc))
+    elif isinstance(exc, anthropic.APIError):
+        failure = ProviderError(str(exc))
+    else:
+        return exc
+    failure.provider_message = _provider_message(getattr(exc, "body", None))
+    return failure
 
 
 # ---------------------------------------------------------------------------
@@ -2021,6 +2028,29 @@ _OPENAI_SPENT_ACCOUNT_CODES = frozenset({
 })
 
 
+def _provider_message(body):
+    """The provider's own sentence out of a parsed error body, or None.
+
+    Handles BOTH shapes the SDKs hand over, because they differ and a caller
+    may inject either: the openai client unwraps the documented
+    `{"error": {...}}` envelope before building the exception, so the message
+    sits at the top level, while the anthropic client passes the whole body
+    through and it sits one layer down. Reading only one shape would give a
+    clean sentence on one provider and None on the other, which is worse than
+    None on both — a consumer would ship the first and discover the second.
+
+    Anything that is not a non-empty string is None, so `provider_message or
+    str(error)` falls back to the full text rather than to an empty pause note.
+    """
+    for layer in (body, (body or {}).get("error") if isinstance(body, dict)
+                  else None):
+        if isinstance(layer, dict):
+            message = layer.get("message")
+            if isinstance(message, str) and message.strip():
+                return message.strip()
+    return None
+
+
 def _openai_error_codes(exc):
     """Every `type` / `code` string an openai exception carries.
 
@@ -2096,34 +2126,42 @@ def _translate_openai_error(exc):
     except ImportError:
         return exc
 
+    # An elif chain rather than a series of returns, so every translated
+    # failure leaves by ONE exit and the provider's sentence is attached there
+    # once. The ORDER is unchanged and still load-bearing; see the docstring.
     if isinstance(exc, openai.RateLimitError):
         # A 429 the ladder cannot clear. See the docstring and
         # `_OPENAI_SPENT_ACCOUNT_CODES`.
         if _openai_error_codes(exc) & _OPENAI_SPENT_ACCOUNT_CODES:
-            return ProviderAccountError(str(exc))
-        return ProviderRateLimitError(str(exc))
+            failure = ProviderAccountError(str(exc))
+        else:
+            failure = ProviderRateLimitError(str(exc))
     # Credentials, not content. BEFORE the general status clause, which these
     # both subclass and which would otherwise flatten them into the base class
     # along with the 400s — the same ordering discipline the timeout clause
     # below depends on.
-    if isinstance(exc, (openai.AuthenticationError,
-                        openai.PermissionDeniedError)):
-        return ProviderAccountError(str(exc))
-    if isinstance(exc, openai.APIStatusError):
+    elif isinstance(exc, (openai.AuthenticationError,
+                          openai.PermissionDeniedError)):
+        failure = ProviderAccountError(str(exc))
+    elif isinstance(exc, openai.APIStatusError):
         code = getattr(exc, "status_code", 0) or 0
         if 500 <= code < 600:
-            return ProviderRetryableError(str(exc), status_code=code)
-        return ProviderError(str(exc))
+            failure = ProviderRetryableError(str(exc), status_code=code)
+        else:
+            failure = ProviderError(str(exc))
     # Timeout before connection: the narrower class first, or the retryable
     # connection clause below would swallow it. See the docstring.
-    if isinstance(exc, openai.APITimeoutError):
-        return ProviderError(str(exc))
-    if isinstance(exc, openai.APIConnectionError):
+    elif isinstance(exc, openai.APITimeoutError):
+        failure = ProviderError(str(exc))
+    elif isinstance(exc, openai.APIConnectionError):
         # No status to record: the request never reached one.
-        return ProviderRetryableError(str(exc))
-    if isinstance(exc, openai.APIError):
-        return ProviderError(str(exc))
-    return exc
+        failure = ProviderRetryableError(str(exc))
+    elif isinstance(exc, openai.APIError):
+        failure = ProviderError(str(exc))
+    else:
+        return exc
+    failure.provider_message = _provider_message(getattr(exc, "body", None))
+    return failure
 
 
 def _translate_error_body(raw):
@@ -2196,10 +2234,16 @@ def _translate_error_body(raw):
     detail = ("provider reported a failure in the response body rather than as "
               f"an HTTP status (code {code!r}): {message or error!r}")
     if status == 429:
-        return ProviderRateLimitError(detail)
-    if status is not None and 500 <= status < 600:
-        return ProviderRetryableError(detail, status_code=status)
-    return ProviderError(detail)
+        failure = ProviderRateLimitError(detail)
+    elif status is not None and 500 <= status < 600:
+        failure = ProviderRetryableError(detail, status_code=status)
+    else:
+        failure = ProviderError(detail)
+    # `detail` above is direktoro's sentence about the body; this is the
+    # gateway's own, kept apart from it so a consumer can show one without the
+    # other. See `ProviderError.provider_message`.
+    failure.provider_message = message or None
+    return failure
 
 
 # The two Responses statuses `_from_wire` can read as an answer: `completed`,
@@ -2279,6 +2323,8 @@ def _translate_responses_error(raw):
     if not unreadable and (not error or raw.get("output")):
         return None
     if not error:
+        # No error object, so no provider sentence to carry: the status is the
+        # whole of what was said, and it is already in the message.
         return ProviderError(
             f"the Responses call carries status {status!r} and no answer to "
             "read; it is refused rather than returned as an empty completion.")
@@ -2294,10 +2340,13 @@ def _translate_responses_error(raw):
     detail = (f"the Responses call did not complete (status {status!r}, error "
               f"code {code!r}): {message or error!r}")
     if code == _RESPONSES_RATE_LIMIT_CODE:
-        return ProviderRateLimitError(detail)
-    if code == _RESPONSES_RETRYABLE_CODE:
-        return ProviderRetryableError(detail)
-    return ProviderError(detail)
+        failure = ProviderRateLimitError(detail)
+    elif code == _RESPONSES_RETRYABLE_CODE:
+        failure = ProviderRetryableError(detail)
+    else:
+        failure = ProviderError(detail)
+    failure.provider_message = message or None
+    return failure
 
 
 # ---------------------------------------------------------------------------

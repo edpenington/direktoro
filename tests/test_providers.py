@@ -31,7 +31,9 @@ from direktoro.providers import (
     _to_chat_completions_wire,
     _to_openai_wire,
     _translate_anthropic_error,
+    _translate_error_body,
     _translate_openai_error,
+    _translate_responses_error,
     create_message_with_retry,
 )
 from direktoro.registry import (
@@ -1829,6 +1831,130 @@ class TestA429ThatNoWaitCanClear:
             create_message_with_retry(adapter, _sleep=slept.append)
         assert adapter.calls == 1
         assert slept == []
+
+
+class TestTheProvidersSentenceArrivesWhole:
+    """`provider_message` carries what the provider actually said, apart from
+    the envelope the SDK wrapped it in.
+
+    A consumer that pauses a run and shows an operator why has one job for this
+    text: say what to do. `str(error)` says it inside a stringified body —
+    "Error code: 429 - {'message': 'You have no credits remaining...',
+    'type': ..., 'param': None}" — which is complete and nearly unreadable.
+    The alternative a consumer reaches for otherwise is picking the sentence
+    out of that rendering, which is one provider rewording away from showing
+    nobody anything. So it is lifted structurally, off the parsed body, at the
+    point where the body is already open."""
+
+    def test_the_base_class_defaults_to_none(self):
+        # `provider_message or str(error)` is the consumer's line, so the
+        # attribute must exist on every provider failure, not only the ones a
+        # translator built.
+        assert ProviderError("no provider spoke").provider_message is None
+
+    def test_the_openai_shape_is_read(self):
+        # The openai client unwraps `{"error": {...}}` before building the
+        # exception, so the message sits at the top level of `body`.
+        sdk = _sdk("openai")
+        body = {"message": "You have no credits remaining. Add credits to "
+                           "continue using the API at "
+                           "https://platform.openai.com/settings/organization/"
+                           "billing/.",
+                "type": "insufficient_quota",
+                "code": "credit_balance_exhausted"}
+        out = _translate_openai_error(sdk.RateLimitError(
+            f"Error code: 429 - {body}", body=body,
+            response=SimpleNamespace(status_code=429, headers={},
+                                     request=None)))
+        assert out.provider_message == (
+            "You have no credits remaining. Add credits to continue using the "
+            "API at https://platform.openai.com/settings/organization/"
+            "billing/.")
+        # The envelope is still on `str`, so nothing is lost by reading the
+        # attribute — it is the same text with the machinery taken off.
+        assert "Error code: 429" in str(out)
+        assert "insufficient_quota" in str(out)
+
+    def test_the_anthropic_shape_is_read(self):
+        # The anthropic client does NOT unwrap: the whole body is passed
+        # through and the message sits one layer down. Reading only the openai
+        # shape would give a clean sentence on one provider and None on the
+        # other — worse than None on both, because a consumer ships the first
+        # and discovers the second.
+        sdk = _sdk("anthropic")
+        body = {"type": "error",
+                "error": {"type": "authentication_error",
+                          "message": "invalid x-api-key"}}
+        out = _translate_anthropic_error(sdk.AuthenticationError(
+            "Error code: 401", body=body,
+            response=SimpleNamespace(status_code=401, headers={},
+                                     request=None)))
+        assert out.provider_message == "invalid x-api-key"
+
+    def test_every_translated_class_carries_it_not_only_account_failures(self):
+        # A human reads a 500 and a 400 too. The attribute is about who SPOKE,
+        # not about which class it landed in.
+        sdk = _sdk("openai")
+        body = {"message": "The server had an error processing your request",
+                "type": "server_error"}
+        out = _translate_openai_error(sdk.InternalServerError(
+            "Error code: 500", body=body,
+            response=SimpleNamespace(status_code=500, headers={},
+                                     request=None)))
+        assert type(out) is ProviderRetryableError
+        assert out.provider_message == (
+            "The server had an error processing your request")
+
+    def test_a_gateway_error_body_carries_the_gateways_words(self):
+        # Here direktoro composes its own sentence about the body, so the two
+        # must not be conflated: `str` is direktoro explaining the refusal,
+        # `provider_message` is what the gateway said.
+        out = _translate_error_body(_error_body(504, "error code: 524\n"))
+        assert out.provider_message == "error code: 524"
+        assert "provider reported a failure in the response body" in str(out)
+
+    def test_a_failed_responses_call_carries_openais_words(self):
+        out = _translate_responses_error(
+            _failed_response("server_error",
+                             "The model failed to generate a response"))
+        assert out.provider_message == (
+            "The model failed to generate a response")
+
+    def test_a_refusal_no_provider_spoke_on_carries_none(self):
+        # The routing refusals are direktoro reasoning about a response that
+        # arrived fine. Inventing a provider sentence for them would
+        # misattribute it, and `provider_message or str(error)` then falls back
+        # to the full explanation, which is the whole of what there is to say.
+        raw = _routed_chat_response("z-ai/glm-4.6v", "Novita")
+        with pytest.raises(ProviderRouteMismatch) as caught:
+            _routed_adapter(raw, {}).create_message(
+                model="z-ai/glm-4.6v", system="S",
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=4096, sampling={"temperature": 0.0})
+        assert caught.value.provider_message is None
+
+    @pytest.mark.parametrize("body", [None, {}, {"message": ""},
+                                      {"message": "   "}, {"message": 7},
+                                      "a bare string", {"error": None}])
+    def test_nothing_usable_reads_as_none_not_as_empty(self, body):
+        # `provider_message or str(error)` must fall back to the full text
+        # rather than to an empty pause note, so anything that is not a
+        # non-empty string is None.
+        sdk = _sdk("openai")
+        out = _translate_openai_error(sdk.RateLimitError(
+            "Error code: 429", body=body,
+            response=SimpleNamespace(status_code=429, headers={},
+                                     request=None)))
+        assert out.provider_message is None
+        assert str(out)
+
+    def test_an_untranslated_exception_is_still_returned_untouched(self):
+        # The single exit must not stamp an attribute onto something this
+        # package did not build.
+        _sdk("openai")
+        original = ValueError("something else entirely")
+        assert _translate_openai_error(original) is original
+        assert not hasattr(original, "provider_message")
 
 
 class TestTranslatorsSurviveAnAbsentSDK:
