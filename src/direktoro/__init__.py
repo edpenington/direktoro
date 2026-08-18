@@ -104,7 +104,7 @@ from direktoro.wire_log import (
 # here and nowhere else: this version can end up inside a caller's own
 # call-identity fingerprint, so a bump moves published provenance and must be
 # deliberate. `tests/test_public_api.py` asserts the wiring.
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 __all__ = [
     "__version__",
