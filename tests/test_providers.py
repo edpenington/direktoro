@@ -1052,6 +1052,23 @@ class TestAGatewayErrorBodyIsNotAResponse:
         error = self._refused(raw, ProviderRetryableError)
         assert error.status_code == 503
 
+    def test_an_error_beside_content_is_still_refused_on_this_wire(self):
+        # THE ONE DELIBERATE RISK HERE, pinned so it stays deliberate. `error`
+        # is no part of the Chat Completions schema, so a body carrying one is
+        # not a completion and is refused whatever else it holds — where the
+        # Responses translator, whose `error` IS a schema field, reads an
+        # answer beside it as an answer. If a gateway ever pairs real content
+        # with an error, this refusal discards a billed answer and the rule
+        # should change; 58 error bodies recorded against this path (2026-08-18,
+        # OpenRouter -> Vertex) carry `choices: null` and nothing else, so it
+        # has not fired, and the evidence for the rule is that corpus rather
+        # than a guess.
+        raw = _error_body(503, "upstream unavailable")
+        raw["choices"] = [{"message": {"role": "assistant", "content": "half"},
+                           "finish_reason": "error"}]
+        error = self._refused(raw, ProviderRetryableError)
+        assert error.status_code == 503
+
     def test_the_refusal_carries_no_billed_response(self):
         # Unlike every routing refusal, which is about a call the gateway
         # already billed: this one is a call that reached the provider and got
@@ -1108,6 +1125,16 @@ class TestAGatewayErrorBodyIsNotAResponse:
         unrouted = dataclasses.replace(model_info("z-ai/glm-4.6v"), route=None)
         monkeypatch.setattr("direktoro.providers.model_info",
                             lambda model_id: unrouted)
+        # The patch has to be doing something, or this passes on the routed
+        # path and proves nothing: an unattributed response that the pin WOULD
+        # have refused comes back normally, which is the unrouted path and only
+        # the unrouted path.
+        unattributed = _routed_chat_response("z-ai/glm-4.6v", None, text="hi")
+        assert _routed_adapter(unattributed, {}).create_message(
+            model="z-ai/glm-4.6v", system="S",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=4096, sampling={"temperature": 0.0}).content[0].text
+
         error = self._refused(_error_body(504, "error code: 524\n"),
                               ProviderRetryableError)
         assert error.status_code == 504
@@ -1199,6 +1226,45 @@ class TestAFailedResponsesCallIsNotAnEmptyAnswer:
         error = self._refused(_failed_response("server_error", "boom"),
                               ProviderRetryableError)
         assert error.response is None
+
+    def test_an_answer_beside_a_stale_error_is_still_an_answer(self):
+        # `error` is a documented field of EVERY Responses object, null on
+        # success, so its presence alone does not mean the body is not a
+        # response — unlike the Chat Completions error body, where `error` is
+        # no part of the schema. A host that completes with output and leaves
+        # a non-null error behind has still answered, and discarding a billed
+        # answer over a contradictory field is worse than any refusal.
+        raw = {"model": "gpt-5.6-terra-2026", "status": "completed",
+               "error": {"code": "server_error", "message": "stale"},
+               "output": [{"type": "message", "content": [
+                   {"type": "output_text", "text": "answered"}]}],
+               "usage": {"input_tokens": 5, "output_tokens": 1}}
+        adapter = OpenAIAdapter(_FakeOpenAIClient(raw, {}), provider="openai",
+                                base_url=OPENAI_BASE_URL)
+        resp = adapter.create_message(
+            model="gpt-5.6-terra", system="S",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=4096, sampling={"temperature": 0.0})
+        assert resp.content[0].text == "answered"
+
+    def test_an_error_with_nothing_beside_it_is_refused_on_any_status(self):
+        # The other half of the same rule: an error and NO output is the silent
+        # empty answer this whole class exists to stop, whatever the status
+        # claims.
+        raw = {"model": "gpt-5.6-terra-2026", "status": "completed",
+               "error": {"code": "server_error", "message": "nothing came"},
+               "output": [], "usage": None}
+        error = self._refused(raw, ProviderRetryableError)
+        assert "nothing came" in str(error)
+
+    def test_an_unreadable_status_outranks_an_answer_beside_it(self):
+        # A `failed` object carrying output is contradictory; the status is the
+        # authoritative field on this wire, so it decides.
+        raw = _failed_response("server_error", "failed mid-flight")
+        raw["output"] = [{"type": "message", "content": [
+            {"type": "output_text", "text": "partial"}]}]
+        error = self._refused(raw, ProviderRetryableError)
+        assert "failed mid-flight" in str(error)
 
     def test_a_transient_failure_reaches_the_retry_ladder(self):
         # End to end on the leg a reviewer runs on: the failed object is

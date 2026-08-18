@@ -2106,9 +2106,23 @@ def _translate_responses_error(raw):
         return None
     error = raw.get("error")
     status = raw.get("status")
+    unreadable = (status is not None
+                  and status not in _RESPONSES_READABLE_STATUSES)
+    # An `error` beside a READABLE status is decisive only when there is no
+    # answer next to it. This is where the two translators part company, and
+    # the wire is the reason: `error` is a documented field of every Responses
+    # object, null on success, so its presence is not by itself proof that the
+    # body is not a response — where on Chat Completions `error` is no part of
+    # the schema at all, and a body carrying one is not a completion. A host
+    # that leaves a stale error on a response that completed WITH output is
+    # therefore read as having answered, because discarding a billed answer
+    # over a contradictory field is the one outcome worth avoiding more than a
+    # loud refusal. Nothing in the failure this guards against is lost to it: a
+    # `failed` object carries no output and no readable status either, so the
+    # first test takes it whatever the second would have said.
+    if not unreadable and (not error or raw.get("output")):
+        return None
     if not error:
-        if status is None or status in _RESPONSES_READABLE_STATUSES:
-            return None
         return ProviderError(
             f"the Responses call carries status {status!r} and no answer to "
             "read; it is refused rather than returned as an empty completion.")
