@@ -1685,6 +1685,86 @@ class TestOpenAIErrorTranslation:
         assert _translate_openai_error(original) is original
 
 
+class TestA429ThatNoWaitCanClear:
+    """OpenAI overloads HTTP 429 for two unrelated conditions: throttling, the
+    most retryable failure there is, and a spent account, the least.
+
+    Classifying on the status alone climbs the whole ladder for a credit
+    balance no wait restores. Recorded 2026-08-18 on a live review leg: four
+    calls walked (2, 5, 11, 23) to exhaustion, ~41 seconds each, to arrive at
+    what the first response had already said — and on a longer batch every
+    subsequent call pays that again, which turns a fast failure into a slow
+    one. The distinguishing evidence is never the status; it is `type` /
+    `code` in the body."""
+
+    # The body as recorded, verbatim.
+    SPENT = {"message": "You have no credits remaining. Add credits to "
+                        "continue using the API at "
+                        "https://platform.openai.com/settings/organization/"
+                        "billing/.",
+             "type": "insufficient_quota", "param": None,
+             "code": "credit_balance_exhausted"}
+
+    def _rate_limit(self, body):
+        sdk = _sdk("openai")
+        return sdk.RateLimitError("Error code: 429", body=body,
+                                  response=SimpleNamespace(
+                                      status_code=429, headers={},
+                                      request=None))
+
+    def test_a_spent_account_is_not_a_rate_limit(self):
+        out = _translate_openai_error(self._rate_limit(self.SPENT))
+        assert type(out) is ProviderError
+        assert not isinstance(out, ProviderRateLimitError)
+
+    def test_an_ordinary_429_still_retries(self):
+        # The default is unchanged and must stay unchanged: this exemption is
+        # narrow, and a throttled call is exactly what the ladder is for.
+        out = _translate_openai_error(self._rate_limit(
+            {"message": "Rate limit reached for gpt-5.6-terra",
+             "type": "rate_limit_error", "code": "rate_limit_exceeded"}))
+        assert type(out) is ProviderRateLimitError
+
+    def test_a_429_with_no_body_at_all_still_retries(self):
+        out = _translate_openai_error(self._rate_limit(None))
+        assert type(out) is ProviderRateLimitError
+
+    @pytest.mark.parametrize("code", ["insufficient_quota",
+                                      "credit_balance_exhausted",
+                                      "billing_hard_limit_reached"])
+    def test_each_spent_account_code_is_refused(self, code):
+        out = _translate_openai_error(
+            self._rate_limit({"message": "no credit", "code": code}))
+        assert type(out) is ProviderError
+
+    def test_the_envelope_is_read_where_a_client_did_not_unwrap_it(self):
+        # The SDK's concrete client unwraps `{"error": {...}}` before building
+        # the exception, but this package supports an injected client, and the
+        # base class does not unwrap. Reading only the top level would fall
+        # back to a retry on the nested shape.
+        out = _translate_openai_error(
+            self._rate_limit({"error": dict(self.SPENT)}))
+        assert type(out) is ProviderError
+
+    def test_the_ladder_does_not_climb_for_it(self):
+        # The point of the classification, end to end: no sleep, one attempt.
+        class _Spent:
+            def __init__(self, exc):
+                self.exc = exc
+                self.calls = 0
+
+            def create_message(self, **kwargs):
+                self.calls += 1
+                raise _translate_openai_error(self.exc)
+
+        adapter = _Spent(self._rate_limit(self.SPENT))
+        slept = []
+        with pytest.raises(ProviderError):
+            create_message_with_retry(adapter, _sleep=slept.append)
+        assert adapter.calls == 1
+        assert slept == []
+
+
 class TestTranslatorsSurviveAnAbsentSDK:
     """This package supports being installed without its provider SDKs, with the
     caller injecting the client. On that shape an unguarded `import` inside a

@@ -1931,6 +1931,46 @@ def _blocks_to_input_items(role, blocks):
     return items
 
 
+# HTTP 429 means two unrelated things on the OpenAI wire and only one of them
+# is worth waiting for. Throttling clears on its own, which is what the ladder
+# is for. A spent account does not: no rung brings the balance back, and every
+# rung climbed is time an operator spends not being told. The status cannot
+# separate them — the evidence is `type` / `code` in the body, and these are
+# the values that mean the account, not the rate.
+_OPENAI_SPENT_ACCOUNT_CODES = frozenset({
+    # The `type` OpenAI sends with both codes below.
+    "insufficient_quota",
+    # Recorded 2026-08-18 on a prepaid balance at zero: four calls walked the
+    # full (2, 5, 11, 23) ladder and exhausted it, ~41 seconds each, to arrive
+    # at what the first response already said.
+    "credit_balance_exhausted",
+    # Documented sibling, not observed here: a configured spend cap rather than
+    # an empty balance. Same shape of fact — a limit a wait does not move.
+    "billing_hard_limit_reached",
+})
+
+
+def _openai_error_codes(exc):
+    """Every `type` / `code` string an openai exception carries.
+
+    The SDK's concrete client unwraps the documented `{"error": {...}}`
+    envelope before constructing the exception, so `exc.code` and `exc.type`
+    normally hold what is wanted. The raw body is read too, in BOTH the
+    unwrapped and the enveloped shape, because this package supports a caller
+    injecting a client it built itself — including one whose error
+    construction is the SDK base class's, which does not unwrap. Falling back
+    to a retry because the body was nested one layer further down is the
+    failure worth spending four lines to avoid.
+    """
+    found = {getattr(exc, "code", None), getattr(exc, "type", None)}
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        for layer in (body, body.get("error")):
+            if isinstance(layer, dict):
+                found |= {layer.get("code"), layer.get("type")}
+    return {value for value in found if isinstance(value, str)}
+
+
 def _translate_openai_error(exc):
     """Map an openai SDK exception to a normalised ProviderError.
 
@@ -1943,6 +1983,21 @@ def _translate_openai_error(exc):
     RETRYABLE (`ProviderRateLimitError` / `ProviderRetryableError`): rate
     limits, 5xx responses, and `APIConnectionError`. A connection that never
     established cannot have been served, so retrying it cannot be charged twice.
+
+    NOT RETRYABLE, DELIBERATELY: a 429 whose body says the ACCOUNT is spent
+    rather than the rate exceeded. OpenAI overloads that status for two
+    unrelated conditions, and classifying on the status alone cannot tell them
+    apart: throttling is the most retryable thing there is, an exhausted credit
+    balance the least. Waiting out the ladder cannot clear a balance, so all it
+    buys is ~41 seconds per call of an operator not being told what the first
+    response already said — and on a long batch every subsequent call pays it
+    again, turning a fast failure into a slow one. The narrow set of codes that
+    mean the account is `_OPENAI_SPENT_ACCOUNT_CODES`; everything else about a
+    429 stays retryable, because retrying a rate limit is the right default and
+    this exemption is not an invitation to widen it. Only this translator
+    carries the clause, because this is the wire the overload was observed on;
+    a spent account arriving as a 4xx other than 429 is already non-retryable
+    on both.
 
     NOT RETRYABLE, DELIBERATELY: `APITimeoutError`. A timeout is the one
     transient failure where the request may already have been served and billed
@@ -1960,6 +2015,10 @@ def _translate_openai_error(exc):
         return exc
 
     if isinstance(exc, openai.RateLimitError):
+        # A 429 the ladder cannot clear. See the docstring and
+        # `_OPENAI_SPENT_ACCOUNT_CODES`.
+        if _openai_error_codes(exc) & _OPENAI_SPENT_ACCOUNT_CODES:
+            return ProviderError(str(exc))
         return ProviderRateLimitError(str(exc))
     if isinstance(exc, openai.APIStatusError):
         code = getattr(exc, "status_code", 0) or 0
