@@ -115,7 +115,15 @@ def create_message_with_retry(adapter, *, _sleep=None, on_retry=None,
     A failed attempt raises inside this function, so it never reaches whatever
     audit log the caller writes after a successful call. A caller that wants
     the retries recorded passes `on_retry(attempt, delay_seconds, error)`,
-    invoked once per retried failure, and logs from there.
+    invoked once per retried failure, and logs from there. TWO PROPERTIES OF
+    IT A LOG IS READ AGAINST, so that reading does not have to be inferred
+    from the tests that pin them: `attempt` is 0-INDEXED, so the first failure
+    reports attempt 0 alongside the first delay; and it is NOT CALLED ON THE
+    FINAL RE-RAISE, so the number of events is the number of rungs actually
+    used. A call that exhausts the schedule emits len(RETRY_BACKOFF_SECONDS)
+    events and then raises, and a call that recovers emits one event per rung
+    it needed — which is what separates recovery from exhaustion in a log that
+    holds only these events and the outcome.
 
     This is one backoff loop shared across a whole call site. A caller running
     calls concurrently and wanting per-call backoff state should keep its own
